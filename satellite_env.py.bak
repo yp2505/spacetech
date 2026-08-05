@@ -1,0 +1,423 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+
+class MultiSatelliteEnv:
+    """
+    A multi-agent core environment for 2 satellite agents.
+    Step 6: Zone-based coordination, realistic 6-action space,
+            battery system, and shaped rewards for proper learning.
+    """
+    def __init__(self, num_positions=20, max_steps=100):
+        self.num_positions = num_positions
+        self.max_steps = max_steps
+        self.np_random = np.random.default_rng()
+
+        self.agent_pos = [0, 0]
+        self.targets = np.zeros(self.num_positions, dtype=np.int8)
+        self.agent_battery = [100, 100]
+        self.agent_pointed = [False, False]
+        self.current_step = 0
+
+        # Dashboard tracking
+        self.reward_history = [[], []]
+        self.cumulative_reward_history = [[], []]
+        self.cumulative_reward = [0.0, 0.0]
+        self.agent_pos_history = [[], []]
+        self.targets_history = []
+        
+        self.targets_hit = [0, 0]
+        self.target_attempts = [0, 0]  # total times agent tried Image/Downlink on correct zone
+        self.wasted_actions = [0, 0]
+        self.out_of_zone_actions = 0
+
+        self.fig = None
+        self.ax_env = None
+        self.ax_rew = None
+        self.ax_cum = None
+
+    def reset(self):
+        self.current_step = 0
+
+        self.agent_pos = [
+            int(self.np_random.integers(0, self.num_positions)),
+            int(self.np_random.integers(0, self.num_positions))
+        ]
+
+        # Initialize targets (0=none, 1=imaging, 2=downlink)
+        # Use higher density (15%) so agents encounter targets often during learning
+        self.targets = np.zeros(self.num_positions, dtype=np.int8)
+        for p in range(self.num_positions):
+            if self.np_random.random() < 0.15:
+                self.targets[p] = self.np_random.choice([1, 2])
+
+        self.agent_battery = [100, 100]
+        self.agent_pointed = [False, False]
+
+        self.reward_history = [[], []]
+        self.cumulative_reward_history = [[], []]
+        self.cumulative_reward = [0.0, 0.0]
+        self.agent_pos_history = [[], []]
+        self.targets_history = []
+        
+        self.targets_hit = [0, 0]
+        self.target_attempts = [0, 0]
+        self.wasted_actions = [0, 0]
+        self.out_of_zone_actions = 0
+
+        return self._get_obs_list(), {}
+
+    def _get_obs_list(self):
+        return [
+            {
+                "agent_pos": self.agent_pos[0],
+                "targets": self.targets.copy(),
+                "battery": self.agent_battery[0],
+                "is_pointed": int(self.agent_pointed[0])
+            },
+            {
+                "agent_pos": self.agent_pos[1],
+                "targets": self.targets.copy(),
+                "battery": self.agent_battery[1],
+                "is_pointed": int(self.agent_pointed[1])
+            }
+        ]
+
+    def step(self, actions):
+        self.current_step += 1
+        rewards = [0.0, 0.0]
+
+        for i in range(2):
+            pos = self.agent_pos[i]
+            in_zone = (0 <= pos <= 9) if i == 0 else (10 <= pos <= 19)
+            has_target = self.targets[pos] != 0
+            target_type = self.targets[pos]
+
+            # Battery drain on all actions except Power Save
+            if actions[i] != 5:
+                self.agent_battery[i] = max(0, self.agent_battery[i] - 1)
+
+            # --- ACTION 0: Move Left ---
+            if actions[i] == 0:
+                self.agent_pos[i] = (self.agent_pos[i] - 1) % self.num_positions
+                self.agent_pointed[i] = False
+                # No reward, no penalty: movement is always neutral
+
+            # --- ACTION 1: Move Right ---
+            elif actions[i] == 1:
+                self.agent_pos[i] = (self.agent_pos[i] + 1) % self.num_positions
+                self.agent_pointed[i] = False
+                # No reward, no penalty: movement is always neutral
+
+            # --- ACTION 2: Point (Slew sensor) ---
+            elif actions[i] == 2:
+                if self.agent_battery[i] > 0:
+                    self.agent_pointed[i] = True
+                    # SHAPED REWARD: +0.05 for pointing at an active in-zone target
+                    # This rewards the correct setup step, even before imaging
+                    if in_zone and has_target:
+                        rewards[i] = 0.05
+                    # No penalty for pointing at empty slot — it's not wrong, just unproductive
+
+            # --- ACTION 3: Image Target ---
+            elif actions[i] == 3:
+                if self.agent_battery[i] > 0 and self.agent_pointed[i] and in_zone:
+                    self.target_attempts[i] += 1
+                    if target_type == 1:  # Correct: imaging target
+                        rewards[i] = 1.0
+                        self.targets_hit[i] += 1
+                        self.targets[pos] = 0
+                        self.agent_pointed[i] = False
+                    else:  # Wrong type (downlink target, or empty)
+                        rewards[i] = -0.05
+                        self.wasted_actions[i] += 1
+                elif not in_zone and self.agent_battery[i] > 0:
+                    # Out-of-zone penalty is the only hard negative
+                    self.out_of_zone_actions += 1
+                    rewards[i] = -0.1
+                else:
+                    # Not pointed, or battery dead: small discouragement
+                    rewards[i] = -0.05
+                    self.wasted_actions[i] += 1
+
+            # --- ACTION 4: Downlink Data ---
+            elif actions[i] == 4:
+                if self.agent_battery[i] > 0 and self.agent_pointed[i] and in_zone:
+                    self.target_attempts[i] += 1
+                    if target_type == 2:  # Correct: downlink target
+                        rewards[i] = 1.0
+                        self.targets_hit[i] += 1
+                        self.targets[pos] = 0
+                        self.agent_pointed[i] = False
+                    else:  # Wrong type (imaging target, or empty)
+                        rewards[i] = -0.05
+                        self.wasted_actions[i] += 1
+                elif not in_zone and self.agent_battery[i] > 0:
+                    self.out_of_zone_actions += 1
+                    rewards[i] = -0.1
+                else:
+                    rewards[i] = -0.05
+                    self.wasted_actions[i] += 1
+
+            # --- ACTION 5: Power Save ---
+            elif actions[i] == 5:
+                self.agent_battery[i] = min(100, self.agent_battery[i] + 10)
+                # No reward for power save — it's a tradeoff, not a mistake
+
+        # Targets persist longer: low appear + very low disappear rate
+        for p in range(self.num_positions):
+            if self.targets[p] == 0:
+                if self.np_random.random() < 0.02:   # ~2% chance to spawn
+                    self.targets[p] = self.np_random.choice([1, 2])
+            else:
+                if self.np_random.random() < 0.01:   # ~1% chance to vanish
+                    self.targets[p] = 0
+
+        # Update metrics
+        for i in range(2):
+            self.reward_history[i].append(rewards[i])
+            self.cumulative_reward[i] += rewards[i]
+            self.cumulative_reward_history[i].append(self.cumulative_reward[i])
+            self.agent_pos_history[i].append(self.agent_pos[i])
+        self.targets_history.append(self.targets.copy())
+
+        terminated = False
+        truncated = self.current_step >= self.max_steps
+
+        return self._get_obs_list(), rewards, terminated, truncated, {}
+
+    def render(self, mode="human"):
+        if self.fig is None:
+            plt.ion()
+            self.fig = plt.figure(figsize=(16, 12), facecolor='#0a0a1a')
+            # 3D plot gets top 60% of the figure
+            self.ax_env = self.fig.add_axes([0.02, 0.38, 0.96, 0.60], projection='3d')
+            self.ax_env.set_facecolor('#0a0a1a')
+            # Two graphs share the bottom 35%
+            self.ax_rew = self.fig.add_axes([0.07, 0.05, 0.40, 0.28])
+            self.ax_cum = self.fig.add_axes([0.55, 0.05, 0.40, 0.28])
+            self.fig.patch.set_facecolor('#0a0a1a')
+
+        ax_env, ax_rew, ax_cum = self.ax_env, self.ax_rew, self.ax_cum
+        ax_env.clear()
+        ax_rew.clear()
+        ax_cum.clear()
+        ax_env.set_facecolor('#0a0a1a')
+
+        radius = 5.5
+
+        # ── Earth (filled sphere) ──────────────────────────────
+        u, v = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
+        earth_r = 1.8
+        x_earth = earth_r * np.cos(u) * np.sin(v)
+        y_earth = earth_r * np.sin(u) * np.sin(v)
+        z_earth = earth_r * np.cos(v)
+        # Blend ocean blue and land green by latitude
+        earth_colors = np.where(np.abs(v - np.pi/2) < 0.6, '#2e7d9e', '#1a5c2e')
+        ax_env.plot_surface(x_earth, y_earth, z_earth,
+                            rstride=1, cstride=1, alpha=0.95,
+                            color='#1a6ea8', shade=True, linewidth=0)
+        # Polar ice caps
+        ice_v = np.mgrid[0:2*np.pi:40j, 0:0.4:5j]
+        for pole_z_sign in [1, -1]:
+            xice = earth_r * np.cos(ice_v[0]) * np.sin(ice_v[1])
+            yice = earth_r * np.sin(ice_v[0]) * np.sin(ice_v[1])
+            zice = pole_z_sign * earth_r * np.cos(ice_v[1])
+            ax_env.plot_surface(xice, yice, zice, alpha=0.7, color='white',
+                                linewidth=0, shade=False)
+
+        # ── Slot angles ───────────────────────────────────────
+        angles = (np.arange(self.num_positions) / self.num_positions) * 2 * np.pi
+        x_slots = radius * np.cos(angles)
+        y_slots = radius * np.sin(angles)
+        z_slots = np.zeros(self.num_positions)
+
+        # ── Continuous orbit rings (full 360°) ────────────────
+        ring_t = np.linspace(0, 2 * np.pi, 360)
+        # Shared orbit path (thin white line)
+        ax_env.plot(radius * np.cos(ring_t), radius * np.sin(ring_t), np.zeros(360),
+                    color='white', alpha=0.15, linewidth=1.2, linestyle='--')
+
+        # ── Zone arcs (thicker, at slightly larger radius) ─────
+        z1_t = np.linspace(0, 9 * 2 * np.pi / self.num_positions, 120)
+        ax_env.plot((radius + 0.5) * np.cos(z1_t), (radius + 0.5) * np.sin(z1_t), np.zeros(120),
+                    color='#ff4444', alpha=0.5, linewidth=6, label='Zone 1 (Sat 1)')
+        z2_t = np.linspace(10 * 2 * np.pi / self.num_positions,
+                           19 * 2 * np.pi / self.num_positions, 120)
+        ax_env.plot((radius + 0.5) * np.cos(z2_t), (radius + 0.5) * np.sin(z2_t), np.zeros(120),
+                    color='#ff9900', alpha=0.5, linewidth=6, label='Zone 2 (Sat 2)')
+
+        # ── Empty orbit slots ─────────────────────────────────
+        ax_env.scatter(x_slots, y_slots, z_slots,
+                       c='#aaaaaa', s=30, alpha=0.5, label='Orbit Slot')
+
+        # ── Imaging targets (yellow stars) ────────────────────
+        img_idx = np.where(self.targets == 1)[0]
+        if len(img_idx) > 0:
+            ax_env.scatter(x_slots[img_idx], y_slots[img_idx], z_slots[img_idx],
+                           c='#ffe033', s=220, marker='*', zorder=5, label='Imaging Target')
+
+        # ── Downlink targets (green stars) ────────────────────
+        dl_idx = np.where(self.targets == 2)[0]
+        if len(dl_idx) > 0:
+            ax_env.scatter(x_slots[dl_idx], y_slots[dl_idx], z_slots[dl_idx],
+                           c='#33ff88', s=220, marker='*', zorder=5, label='Downlink Target')
+
+        # ── Satellites with glow halos ────────────────────────
+        # Halo (large, low alpha)
+        ax_env.scatter(x_slots[self.agent_pos[0]], y_slots[self.agent_pos[0]], 0,
+                       c='red', s=600, alpha=0.18, zorder=4)
+        ax_env.scatter(x_slots[self.agent_pos[1]], y_slots[self.agent_pos[1]], 0,
+                       c='orange', s=600, alpha=0.18, zorder=4)
+        # Core dot
+        ax_env.scatter(x_slots[self.agent_pos[0]], y_slots[self.agent_pos[0]], 0,
+                       c='#ff3333', s=200, zorder=5, label='Sat 1')
+        ax_env.scatter(x_slots[self.agent_pos[1]], y_slots[self.agent_pos[1]], 0,
+                       c='#ff9900', s=200, zorder=5, label='Sat 2')
+
+        ax_env.set_title(f"Satellite Constellation — Step {self.current_step}",
+                         fontweight='bold', color='white', fontsize=14, pad=10)
+        ax_env.set_axis_off()
+
+        limit = radius + 1.8
+        ax_env.set_xlim([-limit, limit])
+        ax_env.set_ylim([-limit, limit])
+        ax_env.set_zlim([-limit, limit])
+
+        # Legend (dark background friendly)
+        handles, labels = ax_env.get_legend_handles_labels()
+        unique = [(h, l) for idx, (h, l) in enumerate(zip(handles, labels)) if l not in labels[:idx]]
+        if unique:
+            handles_u, labels_u = zip(*unique)
+            leg = ax_env.legend(handles_u, labels_u, loc='upper left',
+                                bbox_to_anchor=(0.97, 1.0), fontsize=9,
+                                facecolor='#1a1a2e', edgecolor='#555', labelcolor='white')
+
+        # Stats overlay
+        def sr(i):
+            return f"{self.targets_hit[i]}/{self.target_attempts[i]}" if self.target_attempts[i] > 0 else "0/0"
+
+        batt1_bar = '█' * (self.agent_battery[0] // 10) + '░' * (10 - self.agent_battery[0] // 10)
+        batt2_bar = '█' * (self.agent_battery[1] // 10) + '░' * (10 - self.agent_battery[1] // 10)
+        stats_text = (
+            f"🔴 Sat 1 | Hits: {self.targets_hit[0]} ({sr(0)}) | Wasted: {self.wasted_actions[0]} "
+            f"| Batt: [{batt1_bar}] {self.agent_battery[0]}%\n"
+            f"🟠 Sat 2 | Hits: {self.targets_hit[1]} ({sr(1)}) | Wasted: {self.wasted_actions[1]} "
+            f"| Batt: [{batt2_bar}] {self.agent_battery[1]}%\n"
+            f"Out-of-Zone Actions: {self.out_of_zone_actions}"
+        )
+        ax_env.text2D(0.5, 0.01, stats_text, transform=ax_env.transAxes,
+                      ha='center', fontsize=10, fontweight='bold', color='#ccddff',
+                      fontfamily='monospace')
+
+        # ── Reward graphs (dark theme) ────────────────────────
+        for ax in [ax_rew, ax_cum]:
+            ax.set_facecolor('#0f0f1f')
+            ax.tick_params(colors='#aaaacc')
+            ax.xaxis.label.set_color('#aaaacc')
+            ax.yaxis.label.set_color('#aaaacc')
+            ax.title.set_color('#ccccff')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#333366')
+
+        steps = np.arange(1, len(self.reward_history[0]) + 1)
+        if len(steps) > 0:
+            ax_rew.plot(steps, self.reward_history[0], color='#ff4444', alpha=0.8, linewidth=1.2, label='Sat 1')
+            ax_rew.plot(steps, self.reward_history[1], color='#ff9900', alpha=0.8, linewidth=1.2, label='Sat 2')
+            ax_rew.legend(loc='upper left', fontsize=9, facecolor='#1a1a2e', labelcolor='white', edgecolor='#333')
+        ax_rew.set_title("Reward per Step", fontsize=11)
+        ax_rew.set_ylabel("Reward")
+        ax_rew.set_xlim(0, max(self.max_steps, len(steps)))
+        ax_rew.set_ylim(-0.3, 1.2)
+        ax_rew.grid(True, color='#222244', linewidth=0.5)
+
+        if len(steps) > 0:
+            ax_cum.plot(steps, self.cumulative_reward_history[0], color='#ff4444', linewidth=2.0, label='Sat 1')
+            ax_cum.plot(steps, self.cumulative_reward_history[1], color='#ff9900', linewidth=2.0, label='Sat 2')
+            ax_cum.legend(loc='upper left', fontsize=9, facecolor='#1a1a2e', labelcolor='white', edgecolor='#333')
+        ax_cum.set_title("Cumulative Reward", fontsize=11)
+        ax_cum.set_xlabel("Step")
+        ax_cum.set_ylabel("Total Reward")
+        ax_cum.set_xlim(0, max(self.max_steps, len(steps)))
+        ax_cum.grid(True, color='#222244', linewidth=0.5)
+
+        plt.draw()
+        plt.pause(0.05)
+
+    def close(self):
+        if self.fig is not None:
+            plt.ioff()
+            plt.close(self.fig)
+            self.fig = None
+
+
+class SingleAgentWrapper(gym.Env):
+    """
+    Gym wrapper for a single agent to train using SB3,
+    while simulating the other agent via its model or random actions.
+    """
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+
+    def __init__(self, multi_env, agent_idx):
+        self.multi_env = multi_env
+        self.agent_idx = agent_idx
+        self.other_agent_idx = 1 - agent_idx
+        self.other_model = None
+
+        self.action_space = spaces.Discrete(6)
+        self.observation_space = spaces.Dict({
+            "agent_pos": spaces.Discrete(self.multi_env.num_positions),
+            "targets": spaces.MultiDiscrete([3] * self.multi_env.num_positions),
+            "battery": spaces.Discrete(101),
+            "is_pointed": spaces.Discrete(2)
+        })
+        self.last_obs_list = None
+
+    def set_other_model(self, model):
+        self.other_model = model
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        obs_list, info = self.multi_env.reset()
+        self.last_obs_list = obs_list
+        return obs_list[self.agent_idx], info
+
+    def step(self, action):
+        if self.other_model is None:
+            other_action = self.action_space.sample()
+        else:
+            other_action, _ = self.other_model.predict(
+                self.last_obs_list[self.other_agent_idx], deterministic=False)
+            other_action = int(other_action)
+
+        actions = [0, 0]
+        actions[self.agent_idx] = action
+        actions[self.other_agent_idx] = other_action
+
+        obs_list, rewards, terminated, truncated, info = self.multi_env.step(actions)
+        self.last_obs_list = obs_list
+
+        return obs_list[self.agent_idx], rewards[self.agent_idx], terminated, truncated, info
+
+    def render(self, mode="human"):
+        self.multi_env.render(mode)
+
+    def close(self):
+        self.multi_env.close()
+
+
+if __name__ == "__main__":
+    print("Testing the Coordinated Multi-Agent Dashboard with Random Actions...")
+    multi_env = MultiSatelliteEnv(max_steps=20)
+    multi_env.reset()
+    for step in range(20):
+        multi_env.render()
+        action1 = np.random.randint(0, 6)
+        action2 = np.random.randint(0, 6)
+        multi_env.step([action1, action2])
+    print("Dashboard complete. Close the window to exit.")
+    plt.ioff()
+    plt.show()
+    multi_env.close()

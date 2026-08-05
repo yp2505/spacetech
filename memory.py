@@ -1,0 +1,176 @@
+"""
+memory.py
+---------
+Long-lived Episodic Memory for the multi-satellite AI.
+
+Survives across training runs (persisted to disk as episodic_memory.pkl).
+Stores the top-K most *salient* episodes so the agent can adapt its strategy
+based on past experience — both successes and rare dangerous events.
+
+Memory context vector (4 floats, all in [0, 1]):
+  [0] mean_reward_norm  — overall historical performance level
+  [1] collision_rate    — how often collisions happened  (lower = safer history)
+  [2] fuel_out_rate     — how often fuel ran out         (lower = better history)
+  [3] best_quality      — normalised quality of the best episode ever seen
+
+This vector is appended to every local observation so the Actor can condition
+its policy on its own long-term experience.
+"""
+
+import os
+import pickle
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List
+
+MEMORY_FILE     = "episodic_memory.pkl"
+MEMORY_CAPACITY = 500   # keep the top-K most salient episodes
+
+
+@dataclass
+class EpisodeRecord:
+    """One remembered episode."""
+    episode_id:   int
+    total_reward: float
+    collisions:   int
+    fuel_outs:    int
+    steps:        int
+    was_eclipse:  bool
+    was_weather:  bool
+    salience:     float = field(default=0.0, compare=False)
+
+
+class EpisodicMemory:
+    """
+    Persistent episodic memory that survives across python train.py runs.
+
+    Salience scoring
+    ----------------
+    Both very-good and very-bad episodes are worth keeping.
+    Rare-event episodes (solar storm, collision, fuel-out) get a bonus so
+    the agent never forgets how to handle edge cases.
+    """
+
+    def __init__(self, capacity: int = MEMORY_CAPACITY,
+                 filepath: str = MEMORY_FILE):
+        self.capacity     = capacity
+        self.filepath     = filepath
+        self.episodes:    List[EpisodeRecord] = []
+        self.total_seen:  int   = 0
+        self.best_reward: float = -1e9
+        self.worst_reward:float =  1e9
+        self._load()
+
+    # ── recording ─────────────────────────────────────────────────────────────
+    def record(self, total_reward: float, collisions: int, fuel_outs: int,
+               steps: int, was_eclipse: bool = False,
+               was_weather: bool = False) -> None:
+        """Add one episode to the memory bank."""
+        self.total_seen   += 1
+        self.best_reward   = max(self.best_reward,  total_reward)
+        self.worst_reward  = min(self.worst_reward, total_reward)
+
+        rec = EpisodeRecord(
+            episode_id=self.total_seen,
+            total_reward=total_reward,
+            collisions=collisions,
+            fuel_outs=fuel_outs,
+            steps=steps,
+            was_eclipse=was_eclipse,
+            was_weather=was_weather,
+        )
+        rec.salience = self._salience(rec)
+        self.episodes.append(rec)
+
+        # Keep only the top-K by salience (prune oldest / least salient)
+        if len(self.episodes) > self.capacity:
+            self.episodes.sort(key=lambda e: e.salience, reverse=True)
+            self.episodes = self.episodes[:self.capacity]
+
+    def _salience(self, rec: EpisodeRecord) -> float:
+        """
+        Salience score — higher = more worth remembering.
+        Large absolute reward (good or bad) + rare-event bonus.
+        """
+        base = abs(rec.total_reward)
+        rare = (
+            (2.0 if rec.was_weather   else 0.0) +
+            (1.5 if rec.fuel_outs > 0 else 0.0) +
+            (1.0 if rec.collisions > 0 else 0.0)
+        )
+        return base + rare
+
+    # ── context vector (appended to Actor's local obs) ─────────────────────────
+    def get_context(self) -> np.ndarray:
+        """
+        Returns a 4-dim float32 vector in [0, 1].
+        Safe to call before any episodes are recorded (returns neutral defaults).
+        """
+        if not self.episodes:
+            # Neutral defaults — agent starts with no prior assumptions
+            return np.array([0.5, 0.0, 0.0, 0.5], dtype=np.float32)
+
+        rewards    = [e.total_reward for e in self.episodes]
+        col_rates  = [e.collisions  / max(e.steps, 1) for e in self.episodes]
+        fuel_rates = [e.fuel_outs   / max(e.steps, 1) for e in self.episodes]
+
+        rng = (self.best_reward - self.worst_reward) + 1e-8
+
+        # Normalise mean reward to [0, 1]
+        mean_rew_01 = float(np.clip(
+            (np.mean(rewards) - self.worst_reward) / rng, 0.0, 1.0
+        ))
+        mean_col    = float(np.clip(np.mean(col_rates),  0.0, 1.0))
+        mean_fuel   = float(np.clip(np.mean(fuel_rates), 0.0, 1.0))
+        best_qual   = float(np.clip(
+            (self.best_reward - self.worst_reward) /
+            (abs(self.best_reward) + abs(self.worst_reward) + 1e-8),
+            0.0, 1.0
+        ))
+
+        return np.array([mean_rew_01, mean_col, mean_fuel, best_qual],
+                        dtype=np.float32)
+
+    # ── persistence ────────────────────────────────────────────────────────────
+    def save(self) -> None:
+        """Persist memory to disk."""
+        with open(self.filepath, "wb") as f:
+            pickle.dump({
+                "episodes":     self.episodes,
+                "total_seen":   self.total_seen,
+                "best_reward":  self.best_reward,
+                "worst_reward": self.worst_reward,
+            }, f)
+
+    def _load(self) -> None:
+        """Restore memory from disk if it exists."""
+        if not os.path.exists(self.filepath):
+            return
+        try:
+            with open(self.filepath, "rb") as f:
+                data = pickle.load(f)
+            self.episodes     = data["episodes"]
+            self.total_seen   = data["total_seen"]
+            self.best_reward  = data["best_reward"]
+            self.worst_reward = data["worst_reward"]
+            print(
+                f"[EpisodicMemory] ✓ Restored {len(self.episodes)} episodes "
+                f"({self.total_seen} total seen | "
+                f"Best: {self.best_reward:+.1f} | "
+                f"Worst: {self.worst_reward:+.1f})"
+            )
+        except Exception as exc:
+            print(f"[EpisodicMemory] ⚠ Could not load '{self.filepath}': {exc}. Starting fresh.")
+
+    # ── summary ────────────────────────────────────────────────────────────────
+    @property
+    def stats(self) -> str:
+        if not self.episodes:
+            return "Memory empty — no episodes recorded yet."
+        rewards = [e.total_reward for e in self.episodes]
+        return (
+            f"{len(self.episodes)} episodes stored / {self.total_seen} total seen | "
+            f"Best: {self.best_reward:+.1f} | "
+            f"Worst: {self.worst_reward:+.1f} | "
+            f"Avg(stored): {np.mean(rewards):+.1f}"
+        )
