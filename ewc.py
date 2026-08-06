@@ -171,9 +171,13 @@ class EWC:
 
         for name, param in model.policy.named_parameters():
             if name in self.fisher and name in self.anchors:
-                fisher = self.fisher[name].to(device)
-                anchor = self.anchors[name].to(device)
-                terms.append((fisher * (param - anchor).pow(2)).sum())
+                anchor = self.anchors[name]
+                fisher = self.fisher[name]
+                if param.shape != anchor.shape or param.shape != fisher.shape:
+                    continue
+                fisher_t = fisher.to(device=param.device, dtype=param.dtype)
+                anchor_t = anchor.to(device=param.device, dtype=param.dtype)
+                terms.append((fisher_t * (param - anchor_t).pow(2)).sum())
 
         if not terms:
             return torch.tensor(0.0, device=device)
@@ -217,17 +221,20 @@ class EWC:
         if not self.is_active():
             return float("nan")
 
-        device = next(model.policy.parameters()).device
         total_w_delta = 0.0
         total_fisher  = 0.0
 
         for name, param in model.policy.named_parameters():
             if name in self.fisher and name in self.anchors:
-                F = self.fisher[name].to(device)
-                a = self.anchors[name].to(device)
-                delta          = (param.detach() - a).abs()
-                total_w_delta += (F * delta).sum().item()
-                total_fisher  += F.sum().item()
+                a = self.anchors[name]
+                F = self.fisher[name]
+                if param.shape != a.shape or param.shape != F.shape:
+                    continue
+                F_t = F.to(device=param.device, dtype=param.dtype)
+                a_t = a.to(device=param.device, dtype=param.dtype)
+                delta          = (param.detach() - a_t).abs()
+                total_w_delta += (F_t * delta).sum().item()
+                total_fisher  += F_t.sum().item()
 
         return total_w_delta / max(total_fisher, 1e-12)
 

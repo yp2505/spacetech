@@ -6,14 +6,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 
-from satellite_env import MultiSatelliteEnv, SingleAgentWrapper
+from satellite_env import SingleAgentWrapper
+from memory import EpisodicMemory
 from train import run_evaluation, print_summary
 
 
 def main():
     print("\nLoading saved models…")
-    env1 = SingleAgentWrapper(num_positions=20, max_steps=50, agent_idx=0)
-    env2 = SingleAgentWrapper(num_positions=20, max_steps=50, agent_idx=1)
+    memory = EpisodicMemory()
+    env1 = SingleAgentWrapper(num_positions=360, max_steps=360, agent_idx=0, memory=memory)
+    env2 = SingleAgentWrapper(num_positions=360, max_steps=360, agent_idx=1, memory=memory)
 
     try:
         model1 = PPO.load("ppo_satellite_1", env=env1)
@@ -24,13 +26,13 @@ def main():
         return
 
     print("\n" + "="*62)
-    print("  EVALUATION: 10 episodes, last episode shown live")
+    print("  EVALUATION: 10 episodes")
     print("="*62)
 
     t_coll, t_fuel, t_rew, _ = run_evaluation(
-        model1, model2, num_episodes=10, ep_steps=50, render_last=True
+        model1, model2, memory, num_episodes=10, ep_steps=360, render_last=False
     )
-    print_summary("TRAINED (100k co-training steps)", t_coll, t_fuel, t_rew)
+    print_summary("TRAINED EVALUATION", t_coll, t_fuel, t_rew)
 
 
 if __name__ == "__main__":
