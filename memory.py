@@ -29,15 +29,17 @@ MEMORY_CAPACITY = 500   # keep the top-K most salient episodes
 
 @dataclass
 class EpisodeRecord:
-    """One remembered episode."""
-    episode_id:   int
-    total_reward: float
-    collisions:   int
-    fuel_outs:    int
-    steps:        int
-    was_eclipse:  bool
-    was_weather:  bool
-    salience:     float = field(default=0.0, compare=False)
+    """One remembered episode — includes starting conditions for replay."""
+    episode_id:       int
+    total_reward:     float
+    collisions:       int
+    fuel_outs:        int
+    steps:            int
+    was_eclipse:      bool   = False
+    was_weather:      bool   = False
+    salience:         float  = field(default=0.0, compare=False)
+    # Starting conditions (populated by run_evaluation for high-quality replay)
+    start_conditions: dict   = field(default_factory=dict)
 
 
 class EpisodicMemory:
@@ -64,7 +66,8 @@ class EpisodicMemory:
     # ── recording ─────────────────────────────────────────────────────────────
     def record(self, total_reward: float, collisions: int, fuel_outs: int,
                steps: int, was_eclipse: bool = False,
-               was_weather: bool = False) -> None:
+               was_weather: bool = False,
+               start_conditions: dict = None) -> None:
         """Add one episode to the memory bank."""
         self.total_seen   += 1
         self.best_reward   = max(self.best_reward,  total_reward)
@@ -78,6 +81,7 @@ class EpisodicMemory:
             steps=steps,
             was_eclipse=was_eclipse,
             was_weather=was_weather,
+            start_conditions=start_conditions or {},
         )
         rec.salience = self._salience(rec)
         self.episodes.append(rec)
@@ -99,6 +103,39 @@ class EpisodicMemory:
             (1.0 if rec.collisions > 0 else 0.0)
         )
         return base + rare
+
+    # ── Prioritized Experience Replay ─────────────────────────────────────────
+    def sample_high_reward(self, k: int) -> list:
+        """
+        Prioritized sampling: P(episode_i) ∝ (reward_i - min_reward + ε)^α
+
+        High-reward episodes are selected much more often than average ones.
+        This implements Prioritized Experience Replay (Schaul et al. 2015).
+
+        Args:
+            k: number of episodes to sample (without replacement where possible)
+
+        Returns:
+            List of EpisodeRecord objects, skewed toward high-reward episodes.
+        """
+        if not self.episodes:
+            return []
+
+        rewards = np.array([e.total_reward for e in self.episodes], dtype=np.float64)
+        min_r   = rewards.min()
+
+        # Priority: (reward - min + ε)^α
+        # α = 0.6 is from Schaul et al. 2015 — balances uniform vs greedy
+        priorities = (rewards - min_r + 1e-6) ** 0.6
+        probs      = priorities / priorities.sum()
+
+        k   = min(k, len(self.episodes))
+        idx = np.random.choice(len(self.episodes), size=k, replace=False, p=probs)
+        return [self.episodes[i] for i in idx]
+
+    def top_k_episodes(self, k: int) -> list:
+        """Return the k episodes with highest total reward (for inspection)."""
+        return sorted(self.episodes, key=lambda e: e.total_reward, reverse=True)[:k]
 
     # ── context vector (appended to Actor's local obs) ─────────────────────────
     def get_context(self) -> np.ndarray:
@@ -153,6 +190,19 @@ class EpisodicMemory:
             self.total_seen   = data["total_seen"]
             self.best_reward  = data["best_reward"]
             self.worst_reward = data["worst_reward"]
+
+            # ── Backward-compatibility migration ──────────────────────────────
+            # Old pickles won't have start_conditions on each EpisodeRecord.
+            # Patch them in-place so sample_high_reward() works safely.
+            migrated = 0
+            for ep in self.episodes:
+                if not hasattr(ep, "start_conditions"):
+                    ep.start_conditions = {}
+                    migrated += 1
+            if migrated:
+                print(f"[EpisodicMemory] ℹ Migrated {migrated} records "
+                      f"(added start_conditions={{}})")
+
             print(
                 f"[EpisodicMemory] ✓ Restored {len(self.episodes)} episodes "
                 f"({self.total_seen} total seen | "

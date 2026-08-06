@@ -81,8 +81,8 @@ class CTDEMlpExtractor(nn.Module):
         self,
         local_dim:     int,
         global_dim:    int,
-        actor_hidden:  List[int] = [128, 128],      # Phase 3: keep same capacity
-        critic_hidden: List[int] = [256, 256, 128], # Phase 3: keep same capacity
+        actor_hidden:  List[int] = [256, 256],      # Upgraded Phase 4 capacity
+        critic_hidden: List[int] = [512, 512, 256], # Upgraded Phase 4 capacity
     ):
         super().__init__()
         self.local_dim = local_dim

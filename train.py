@@ -26,10 +26,11 @@ from stable_baselines3.common.utils import obs_as_tensor
 
 from satellite_env import (
     MultiSatelliteEnv, SingleAgentWrapper,
-    LOCAL_DIM, GLOBAL_DIM,
+    LOCAL_DIM, GLOBAL_DIM, TARGET_SLOT_GAP,
 )
 from ctde_policy  import CTDEPolicy
 from memory       import EpisodicMemory
+from ewc          import EWC
 
 
 # ── Architecture version marker ────────────────────────────────────────────────
@@ -40,6 +41,10 @@ ARCH_VERSION    = "CTDEv3_local15_global13_thrust5"
 ARCH_FILE       = "arch_version.txt"
 MODEL1_PATH     = "ppo_satellite_1"
 MODEL2_PATH     = "ppo_satellite_2"
+EWC1_PATH       = "ewc_fisher_sat1.pkl"
+EWC2_PATH       = "ewc_fisher_sat2.pkl"
+EWC_LAMBDA      = 5_000.0   # Kirkpatrick 2017 default
+EWC_N_SAMPLES   = 300       # states sampled to compute Fisher
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,10 +171,12 @@ def log_q_values(model, env_wrapper: SingleAgentWrapper, label: str):
 #  Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 def run_evaluation(model1, model2, memory: EpisodicMemory,
-                   num_episodes=10, ep_steps=360, render_last=True):
+                   num_episodes=10, ep_steps=360, render_last=True,
+                   store_start_conditions=True):
     """
     Runs num_episodes evaluation episodes in a fresh shared environment.
     Returns per-episode stats and records every episode into episodic memory.
+    store_start_conditions: if True, save starting state for PER replay.
     """
     collisions_per_ep  = [[], []]
     fuel_outs_per_ep   = [[], []]
@@ -178,6 +185,7 @@ def run_evaluation(model1, model2, memory: EpisodicMemory,
     for ep in range(num_episodes):
         env        = MultiSatelliteEnv(max_steps=ep_steps)
         obs_raw, _ = env.reset()
+        start_cond = env.get_start_conditions() if store_start_conditions else {}
         do_render  = render_last and (ep == num_episodes - 1)
 
         for step in range(ep_steps):
@@ -205,13 +213,15 @@ def run_evaluation(model1, model2, memory: EpisodicMemory,
 
         # Record each evaluation episode into long-term episodic memory
         for i in range(2):
+            ep_rew = np.sum(env.reward_history[i])
             memory.record(
-                total_reward=np.sum(env.reward_history[i]),
+                total_reward=ep_rew,
                 collisions=env.collisions[i],
                 fuel_outs=env.fuel_outs[i],
                 steps=env.current_step,
-                was_eclipse=env.eclipse_mode,
+                was_eclipse=any(env.eclipse_mode),
                 was_weather=env.space_weather_active,
+                start_conditions=start_cond if ep_rew > 0 else {},
             )
 
         if do_render:
@@ -252,7 +262,7 @@ def main():
     args = parser.parse_args()
 
     chunk_steps     = 5_000    # steps per agent per co-training cycle
-    num_cycles      = 60       # total cycles → 300k steps total
+    num_cycles      = 200      # total cycles → 1 Million steps total
     total_timesteps = chunk_steps * num_cycles
 
     # ── Episodic memory (persistent across runs) ───────────────────────────────
@@ -260,11 +270,17 @@ def main():
     print(f"\n[Memory] {memory.stats}")
 
     print("\n" + "="*62)
-    print("  INITIALIZATION  (CTDE + Episodic Memory)")
+    print("  INITIALIZATION  (CTDE + Episodic Memory + EWC + PER)")
     print("="*62)
     print(f"  Policy : CTDEPolicy  "
           f"(Actor: local {LOCAL_DIM}-dim | Critic: global {GLOBAL_DIM}-dim)")
     print(f"  Arch   : {ARCH_VERSION}")
+
+    # ── EWC (Elastic Weight Consolidation) ────────────────────────────────────
+    ewc1 = EWC(ewc_lambda=EWC_LAMBDA, filepath=EWC1_PATH)
+    ewc2 = EWC(ewc_lambda=EWC_LAMBDA, filepath=EWC2_PATH)
+    ewc_active = ewc1.is_active() and ewc2.is_active()
+    print(f"  EWC    : {'ACTIVE (λ={EWC_LAMBDA:.0f})  — protecting Task-1 knowledge' if ewc_active else 'inactive (Fisher not yet computed)'}")
 
     # ── Environments (each agent owns its own env) ─────────────────────────────
     env1 = SingleAgentWrapper(num_positions=360, max_steps=360,
@@ -309,24 +325,39 @@ def main():
 
     if not args.eval_only:
         for cycle in range(1, num_cycles + 1):
+            # ── Curriculum Learning Phase progression ──────────────────────────
+            if cycle <= 20:
+                phase = 1
+            elif cycle <= 40:
+                phase = 2
+            elif cycle <= 100:
+                phase = 3
+            else:
+                phase = 4
+            env1.set_curriculum_phase(phase)
+            env2.set_curriculum_phase(phase)
+
             # Use frozen previous-cycle opponent (or current model on cycle 1)
             env1.set_other_model(lagged2 if lagged2 else model2)
             model1.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
+            # EWC correction: pull important weights back toward Task-1 anchors
+            ewc_loss1 = ewc1.apply_correction(model1, n_steps=5)
     
             env2.set_other_model(lagged1 if lagged1 else model1)
             model2.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
+            ewc_loss2 = ewc2.apply_correction(model2, n_steps=5)
 
             # Freeze snapshots for NEXT cycle's opponent
             lagged1 = LaggedPolicy(model1)
             lagged2 = LaggedPolicy(model2)
 
-            # ── Extract mean episode reward ────────────────────────────────────────
-            def mean_rew(model):
+            # ── Extract max episode reward (best run of this cycle) ────────────────
+            def max_rew(model):
                 buf = model.ep_info_buffer
-                return np.mean([ep["r"] for ep in buf]) if len(buf) > 0 else float("nan")
+                return np.max([ep["r"] for ep in buf]) if len(buf) > 0 else float("nan")
 
-            r1 = mean_rew(model1)
-            r2 = mean_rew(model2)
+            r1 = max_rew(model1)
+            r2 = max_rew(model2)
 
             # ── Record training episodes into episodic memory ──────────────────────
             # ep_info_buffer has {r: total_reward, l: episode_length, t: time}
@@ -373,6 +404,17 @@ def main():
 
     print(f"\n  Models saved → {MODEL1_PATH}.zip / {MODEL2_PATH}.zip")
     print(f"  Memory saved  → episodic_memory.pkl  ({memory.stats})")
+
+    # ── Compute EWC Fisher matrices after Task-1 training ─────────────────────
+    # This marks the "end of Task 1" checkpoint.  Fisher matrices will protect
+    # this knowledge during any future Task-2 training.
+    if not args.eval_only:
+        print("\n" + "="*62)
+        print("  COMPUTING EWC FISHER MATRICES (Task-1 checkpoint)")
+        print("="*62)
+        ewc1.compute_fisher(model1, env1, n_samples=EWC_N_SAMPLES)
+        ewc2.compute_fisher(model2, env2, n_samples=EWC_N_SAMPLES)
+        print(f"  [EWC] Fisher matrices saved → {EWC1_PATH}, {EWC2_PATH}")
 
     # ── Post-training evaluation ───────────────────────────────────────────────
     print("\n" + "="*62)

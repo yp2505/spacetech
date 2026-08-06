@@ -177,9 +177,12 @@ class MultiSatelliteEnv:
     Two satellites in DIFFERENT orbital shells whose orbits cross in 3D space.
     """
 
-    def __init__(self, num_positions: int = 360, max_steps: int = 380):
+    def __init__(self, num_positions: int = 360, max_steps: int = 380,
+                 target_gap: float = TARGET_SLOT_GAP):
         self.num_positions = num_positions
         self.max_steps     = max_steps
+        self.target_gap    = target_gap       # 90° default; Task-2 can override
+        self.curriculum_phase = 3             # 1=gap only, 2=+eclipse/battery, 3=full physics
         self.np_random     = np.random.default_rng()
         self.physics       = get_shared_physics()
         _init_vel_constants(self.physics)
@@ -285,25 +288,58 @@ class MultiSatelliteEnv:
         self.isl_distance_km = float(np.sqrt(
             (x0[p0]-x1[p1])**2 + (y0[p0]-y1[p1])**2 + (z0[p0]-z1[p1])**2
         ))
-        self.isl_active = self.isl_distance_km <= ISL_MAX_RANGE_KM
+        if self.curriculum_phase < 3:
+            self.isl_active = True
+        else:
+            self.isl_active = self.isl_distance_km <= ISL_MAX_RANGE_KM
 
     # ── reset ──────────────────────────────────────────────────────────────────
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
+
         self.current_step = 0
 
-        # ── 1. Randomise sun position and beta angles ─────────────────────────
+        # ── Domain Randomization (disabled in Phase 1 for stability) ─────────
+        if self.curriculum_phase >= 4:
+            self.ep_thruster_eff = [float(self.np_random.uniform(0.7, 1.3)), 
+                                    float(self.np_random.uniform(0.7, 1.3))]
+            self.ep_battery_cap  = [float(self.np_random.uniform(80.0, 120.0)),
+                                    float(self.np_random.uniform(80.0, 120.0))]
+            self.ep_fuel_cap     = [float(self.np_random.uniform(75.0, 100.0)),
+                                    float(self.np_random.uniform(75.0, 100.0))]
+            self.ep_perturb_chance = PERTURB_CHANCE * float(self.np_random.uniform(0.5, 2.5))
+        elif self.curriculum_phase >= 2:
+            self.ep_thruster_eff = [float(self.np_random.uniform(0.8, 1.2)), 
+                                    float(self.np_random.uniform(0.8, 1.2))]
+            self.ep_battery_cap  = [float(self.np_random.uniform(90.0, 110.0)),
+                                    float(self.np_random.uniform(90.0, 110.0))]
+            self.ep_fuel_cap     = [float(self.np_random.uniform(85.0, 100.0)),
+                                    float(self.np_random.uniform(85.0, 100.0))]
+            self.ep_perturb_chance = PERTURB_CHANCE * float(self.np_random.uniform(0.5, 1.5))
+        else:
+            self.ep_thruster_eff = [1.0, 1.0]
+            self.ep_battery_cap  = [100.0, 100.0]
+            self.ep_fuel_cap     = [100.0, 100.0]
+            self.ep_perturb_chance = PERTURB_CHANCE
+
+        # ── 1. Randomise sun direction and beta angles ────────────────────────
         self.sun_angle_deg = float(self.np_random.uniform(0, 360))
         for i in range(2):
+            self.eclipse_half_deg[i] = ECLIPSE_HALF_ANGLE[i] * float(self.np_random.uniform(0.95, 1.05))
+            if self.curriculum_phase < 2:
+                self.eclipse_half_deg[i] = 0.0  # Phase 1: No eclipse
+
             # Beta angle: 0° = sun exactly in orbit plane (max eclipse)
             # Real distribution: weighted toward lower beta (sun often near equatorial plane)
             self.beta_angle_deg[i] = float(self.np_random.uniform(
-                -ECLIPSE_HALF_ANGLE[i] * 0.9,
-                 ECLIPSE_HALF_ANGLE[i] * 0.9
+                -self.eclipse_half_deg[i] * 0.9,
+                 self.eclipse_half_deg[i] * 0.9
             ))
 
-        # ── 2. Fully random spawn positions across the whole orbit ────────────
+        # ── 2. Random spawn positions (close enough to target to allow high scores) ──
         pos0 = float(self.np_random.uniform(0, 360))
-        offset = float(self.np_random.uniform(20, 340))
+        offset = float(self.np_random.uniform(45, 135))  # target is 90, max error is 45°
         pos1 = (pos0 + offset) % 360.0
 
         # ── 3. Random starting velocities (insertion burn variation) ──────────
@@ -314,22 +350,40 @@ class MultiSatelliteEnv:
 
         # ── 4. Worst-case scenario injection ─────────────────────────────────
         scenario   = self.np_random.random()
-        fuel_start = [100.0, 100.0]
-        bat_start  = [100.0, 100.0]
+        fuel_start = list(self.ep_fuel_cap)
+        bat_start  = list(self.ep_battery_cap)
 
-        if scenario < 0.07:
-            # LOW FUEL EMERGENCY: end-of-life satellite, propellant critically low
-            low = int(self.np_random.integers(0, 2))
-            fuel_start[low] = float(self.np_random.uniform(10.0, 35.0))
-        elif scenario < 0.13:
-            # POWER EMERGENCY: solar panel partially failed / damaged
-            dead = int(self.np_random.integers(0, 2))
-            bat_start[dead] = float(self.np_random.uniform(18.0, 45.0))
-        elif scenario < 0.18:
-            # STORM START: geomagnetic storm active from t=0
-            self.space_weather_active = True
-        else:
-            self.space_weather_active = (self.np_random.random() < 0.15)
+        self.space_weather_active = False
+        if self.curriculum_phase >= 4:
+            if scenario < 0.10:
+                low = int(self.np_random.integers(0, 2))
+                fuel_start[low] = float(self.np_random.uniform(5.0, 20.0))
+            elif scenario < 0.25: # Very high chance of power failure
+                dead = int(self.np_random.integers(0, 2))
+                bat_start[dead] = float(self.np_random.uniform(10.0, 30.0))
+            elif scenario < 0.35:
+                self.space_weather_active = True
+            else:
+                self.space_weather_active = (self.np_random.random() < 0.25)
+        elif self.curriculum_phase >= 3:
+            if scenario < 0.07:
+                # LOW FUEL EMERGENCY: end-of-life satellite, propellant critically low
+                low = int(self.np_random.integers(0, 2))
+                fuel_start[low] = float(self.np_random.uniform(10.0, 35.0))
+            elif scenario < 0.13:
+                # POWER EMERGENCY: solar panel partially failed / damaged
+                dead = int(self.np_random.integers(0, 2))
+                bat_start[dead] = float(self.np_random.uniform(18.0, 45.0))
+            elif scenario < 0.18:
+                # STORM START: geomagnetic storm active from t=0
+                self.space_weather_active = True
+            else:
+                self.space_weather_active = (self.np_random.random() < 0.15)
+        elif self.curriculum_phase >= 2:
+            if scenario < 0.13:
+                # POWER EMERGENCY only in phase 2
+                dead = int(self.np_random.integers(0, 2))
+                bat_start[dead] = float(self.np_random.uniform(18.0, 45.0))
 
         self.agent_pos     = [pos0, pos1]
         self.agent_fuel    = fuel_start
@@ -346,7 +400,7 @@ class MultiSatelliteEnv:
             self.penumbra_mode[i] = pen
 
         # ── 5. Pre-spawn debris in dangerous proximity (5% chance) ────────────
-        if self.np_random.random() < 0.05:
+        if self.curriculum_phase >= 3 and self.np_random.random() < 0.05:
             n = int(self.np_random.integers(1, 3))
             for _ in range(n):
                 target_sat = int(self.np_random.integers(0, 2))
@@ -369,7 +423,7 @@ class MultiSatelliteEnv:
         self.debris_history            = []
         self.collisions                = [0, 0]
         self.fuel_outs                 = [0, 0]
-        self._prev_gap_err = abs(self._angular_gap() - TARGET_SLOT_GAP)
+        self._prev_gap_err = abs(self._angular_gap() - self.target_gap)
 
         return self._get_obs_list(), {}
 
@@ -392,7 +446,7 @@ class MultiSatelliteEnv:
         deb         = self._build_debris_array()
         partner_idx = 1 - agent_idx
         gap         = self._angular_gap()
-        gap_err     = abs(gap - TARGET_SLOT_GAP)
+        gap_err     = abs(gap - self.target_gap)
         gap_err_norm = float(np.clip(gap_err / 90.0, 0.0, 1.0))   # max gap_err = 90°
 
         vel_diff     = self.agent_vel[agent_idx] - self.agent_vel[partner_idx]
@@ -458,19 +512,24 @@ class MultiSatelliteEnv:
         rewards    = [0.0, 0.0]
         terminated = False
 
-        current_perturb = SOLAR_PERTURB if self.space_weather_active else PERTURB_CHANCE
+        if self.curriculum_phase < 3:
+            current_perturb = 0.0
+        else:
+            base_perturb = getattr(self, 'ep_perturb_chance', PERTURB_CHANCE)
+            current_perturb = SOLAR_PERTURB if self.space_weather_active else base_perturb
 
         # ── 1. Debris dynamics ────────────────────────────────────────────────
         for d in self.debris:
             d['pos'] = (d['pos'] + d['vel']) % self.num_positions
 
-        if len(self.debris) < MAX_DEBRIS and self.np_random.random() < DEBRIS_SPAWN:
-            self.debris.append({
-                'pos': float(self.np_random.uniform(0, self.num_positions)),
-                'vel': float(self.np_random.choice([-1.0, 1.0])),
-            })
-        if self.debris and self.np_random.random() < DEBRIS_DESPAWN:
-            self.debris.pop(0)
+        if self.curriculum_phase >= 3:
+            if len(self.debris) < MAX_DEBRIS and self.np_random.random() < DEBRIS_SPAWN:
+                self.debris.append({
+                    'pos': float(self.np_random.uniform(0, self.num_positions)),
+                    'vel': float(self.np_random.choice([-1.0, 1.0])),
+                })
+            if self.debris and self.np_random.random() < DEBRIS_DESPAWN:
+                self.debris.pop(0)
 
         # ── 2. Per-satellite physics ──────────────────────────────────────────
         solar_fractions = [1.0, 1.0]
@@ -501,6 +560,10 @@ class MultiSatelliteEnv:
             action_i        = int(actions[i])
             self.agent_action[i] = action_i
             delta_v, fuel_cost = THRUSTER_CONFIG[action_i]
+            
+            eff = getattr(self, 'ep_thruster_eff', [1.0, 1.0])[i]
+            delta_v *= eff
+            
             lo, hi          = VEL_RANGE[i]
 
             can_thrust = (
@@ -544,25 +607,25 @@ class MultiSatelliteEnv:
         # ── 4. POTENTIAL-BASED REWARD SHAPING ────────────────────────────────
         # Industry-standard dense reward: reward the CHANGE in error, not just state
         gap     = self._angular_gap()
-        gap_err = abs(gap - TARGET_SLOT_GAP)
+        gap_err = abs(gap - self.target_gap)
         improvement = self._prev_gap_err - gap_err   # +ve = improving
         self._prev_gap_err = gap_err
 
         for i in range(2):
             # A. Approach reward (always gives learning gradient)
-            rewards[i] += improvement * 0.018
+            rewards[i] += improvement * 0.1  # Stronger gradient to pull agent toward target
 
             # B. Slot-keeping maintenance bonus (primary mission objective)
-            if gap_err <= 1.5:
-                rewards[i] += 1.0                           # near-perfect
-            elif gap_err <= 5.0:
-                rewards[i] += 0.85 - gap_err * 0.07        # very good
-            elif gap_err <= 15.0:
-                rewards[i] += 0.30 * (1.0 - gap_err / 15.0)  # approaching
+            if gap_err <= 2.0:
+                rewards[i] += 1.0                           # perfect
+            elif gap_err <= 10.0:
+                rewards[i] += 0.8 - (gap_err - 2.0) * 0.05  # very good (0.8 down to 0.4)
+            elif gap_err <= 30.0:
+                rewards[i] += 0.4 * (1.0 - (gap_err - 10.0) / 20.0) # approaching (0.4 down to 0)
 
             # C. Fuel conservation bonus (coast when on target)
-            if gap_err <= 8.0 and self.agent_action[i] == 2:
-                rewards[i] += 0.06
+            if gap_err <= 10.0 and self.agent_action[i] == 2:
+                rewards[i] += 0.1
 
             # D. Thruster efficiency penalty
             if self.agent_action[i] in (0, 4):
@@ -576,7 +639,11 @@ class MultiSatelliteEnv:
 
             # F. Safe mode penalty (being in safe mode = operational failure)
             if self.in_safe_mode[i]:
-                rewards[i] -= 0.08
+                # Gradient Spike: Massive instant penalty if we JUST entered safe mode
+                if self.agent_battery[i] >= SAFE_MODE_THRESHOLD - ECLIPSE_DRAIN_BASE - 1.0:
+                    rewards[i] -= 10.0 # Ouch! 
+                else:
+                    rewards[i] -= 0.08 # bleed
 
             # G. Debris collision avoidance
             #    TCA-inspired: proximity × relative velocity → collision risk
@@ -588,7 +655,7 @@ class MultiSatelliteEnv:
                 vel_factor = min(rel_vel / 2.0, 2.0)
 
                 if prox < 2.0:
-                    rewards[i] -= 0.5 * (1.0 + vel_factor * 0.3)
+                    rewards[i] -= 10.0 * (1.0 + vel_factor * 0.3) # Gradient Spike for collision
                     self.collisions[i] += 1
                 elif prox < 4.0:
                     rewards[i] -= 0.12 * (1.0 + vel_factor * 0.2)
@@ -745,7 +812,7 @@ class MultiSatelliteEnv:
 
         hud = "\n".join([
             f"STEP {self.current_step:03d}/{self.max_steps}  SIM {sim_t_min:.1f} min",
-            f"GAP {gap:.1f}°  →TARGET 90°  ERR {abs(gap-TARGET_SLOT_GAP):.1f}°",
+            f"GAP {gap:.1f}°  →TARGET {self.target_gap:.0f}°  ERR {abs(gap-self.target_gap):.1f}°",
             f"ISL {self.isl_distance_km:.0f}km  {'✓ ACTIVE' if self.isl_active else '✗ BROKEN (noisy obs)'}",
             f"SUN {self.sun_angle_deg:.0f}°",
             "",
@@ -826,6 +893,23 @@ class MultiSatelliteEnv:
         self.fig.canvas.draw()
         plt.pause(0.005)
 
+    def get_start_conditions(self) -> dict:
+        """
+        Return a snapshot of the current episode's starting conditions.
+        Call this immediately after reset() to capture the initial state.
+        Used by EpisodicMemory for Prioritized Experience Replay.
+        """
+        return {
+            "pos":         list(self.agent_pos),
+            "vel":         list(self.agent_vel),
+            "fuel":        list(self.agent_fuel),
+            "bat":         list(self.agent_battery),
+            "sun_angle":   self.sun_angle_deg,
+            "beta_angles": dict(self.beta_angle_deg),
+            "weather":     self.space_weather_active,
+            "target_gap":  self.target_gap,
+        }
+
     def close(self):
         import matplotlib.pyplot as plt
         if self.fig is not None:
@@ -840,16 +924,24 @@ class SingleAgentWrapper(gym.Env):
     Wraps MultiSatelliteEnv for SB3 PPO.
     Action: Discrete(5) — 5 thruster levels.
     Obs: local(15) + global(13).
+
+    replay_prob: probability that reset() initialises from a high-reward
+                 memory episode instead of a fully random start.
+                 Set to 0.20 during Task-2 training to retain Task-1 habits.
     """
 
     def __init__(self, num_positions: int = 360, max_steps: int = 380,
-                 agent_idx: int = 0, memory=None):
+                 agent_idx: int = 0, memory=None,
+                 target_gap: float = TARGET_SLOT_GAP,
+                 replay_prob: float = 0.0):
         super().__init__()
         self.env       = MultiSatelliteEnv(num_positions=num_positions,
-                                           max_steps=max_steps)
-        self.agent_idx = agent_idx
-        self._memory   = memory
+                                           max_steps=max_steps,
+                                           target_gap=target_gap)
+        self.agent_idx   = agent_idx
+        self._memory     = memory
         self._other_model = None
+        self._replay_prob = replay_prob   # 0.0 = pure random, 0.2 = 20% from memory
 
         self.action_space = spaces.Discrete(5)
         self.observation_space = spaces.Dict({
@@ -860,6 +952,9 @@ class SingleAgentWrapper(gym.Env):
         })
 
     def set_other_model(self, m): self._other_model = m
+
+    def set_curriculum_phase(self, phase: int):
+        self.env.curriculum_phase = phase
 
     def _get_memory_ctx(self):
         if self._memory is not None:
@@ -874,7 +969,38 @@ class SingleAgentWrapper(gym.Env):
         }
 
     def reset(self, seed=None, options=None):
+        """Reset, optionally starting from a high-reward memory episode."""
         obs_list, _ = self.env.reset()
+
+        # Prioritized Experience Replay: with probability replay_prob,
+        # override random starting conditions with those of a remembered
+        # high-reward episode.  This biases training rollouts toward states
+        # where the agent previously succeeded.
+        if (self._replay_prob > 0.0
+                and self._memory is not None
+                and np.random.random() < self._replay_prob):
+            sampled = self._memory.sample_high_reward(k=1)
+            if sampled:
+                sc = sampled[0].start_conditions
+                if sc:  # non-empty (has stored conditions)
+                    env = self.env
+                    env.agent_pos     = list(sc.get("pos",   env.agent_pos))
+                    env.agent_vel     = list(sc.get("vel",   env.agent_vel))
+                    env.agent_fuel    = list(sc.get("fuel",  env.agent_fuel))
+                    env.agent_battery = list(sc.get("bat",   env.agent_battery))
+                    env.sun_angle_deg  = sc.get("sun_angle", env.sun_angle_deg)
+                    saved_beta = sc.get("beta_angles", {})
+                    for k, v in saved_beta.items():
+                        env.beta_angle_deg[int(k)] = v
+                    env._prev_gap_err = abs(env._angular_gap() - env.target_gap)
+                    # Recompute initial eclipse status
+                    for i in range(2):
+                        ecl, pen, _ = env._compute_eclipse(i, env.agent_pos[i])
+                        env.eclipse_mode[i]  = ecl
+                        env.penumbra_mode[i] = pen
+                    env._update_isl()
+                    obs_list = env._get_obs_list()
+
         return self._augment(obs_list[self.agent_idx]), {}
 
     def step(self, action):
