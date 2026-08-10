@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpaceTech AI — Satellite Constellation</title>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.117/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#080810; font-family:'Segoe UI',sans-serif; overflow:hidden; }
+  #cesiumContainer { width:100vw; height:100vh; }
+
+  #hud {
+    position:fixed; top:16px; left:16px; z-index:100;
+    background:rgba(8,8,20,0.85);
+    border:1px solid rgba(80,120,255,0.4);
+    border-radius:12px; padding:14px 18px;
+    color:#e0e8ff; min-width:260px;
+    backdrop-filter:blur(8px);
+  }
+  #hud h2 { font-size:14px; color:#7ab4ff; margin-bottom:10px; letter-spacing:1px; }
+  .hud-row { display:flex; justify-content:space-between; margin:4px 0; font-size:12px; }
+  .hud-val { font-weight:bold; color:#fff; }
+  .hud-val.warn { color:#ff6060; }
+  .hud-val.ok   { color:#40ff80; }
+
+  #legend {
+    position:fixed; bottom:60px; left:16px; z-index:100;
+    background:rgba(8,8,20,0.85);
+    border:1px solid rgba(80,120,255,0.4);
+    border-radius:10px; padding:12px 16px;
+    color:#e0e8ff;
+    backdrop-filter:blur(8px);
+  }
+  #legend h3 { font-size:12px; color:#7ab4ff; margin-bottom:8px; }
+  .leg-item { display:flex; align-items:center; gap:8px; font-size:11px; margin:3px 0; }
+  .leg-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+
+  #title-bar {
+    position:fixed; top:16px; left:50%; transform:translateX(-50%);
+    z-index:100; text-align:center;
+    color:white; font-size:16px; font-weight:bold;
+    text-shadow:0 0 20px rgba(100,150,255,0.8);
+    pointer-events:none;
+  }
+  #step-info {
+    position:fixed; top:50px; left:50%; transform:translateX(-50%);
+    z-index:100; font-size:12px; color:#aabbff;
+    pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<div id="cesiumContainer"></div>
+
+<div id="title-bar">🛰 SpaceTech AI — Walker Delta Constellation (10 Satellites)</div>
+<div id="step-info">AI-controlled LEO orbital swarm | Phase-adaptive PPO Brain | 200 Training Cycles</div>
+
+<div id="hud">
+  <h2>📡 FLEET STATUS</h2>
+  <div class="hud-row"><span>Simulation Time</span><span class="hud-val" id="hud-time">—</span></div>
+  <div class="hud-row"><span>Active Satellites</span><span class="hud-val ok" id="hud-sats">10 / 10</span></div>
+  <div class="hud-row"><span>Ground Contacts</span><span class="hud-val" id="hud-los">—</span></div>
+  <div class="hud-row"><span>Debris Field</span><span class="hud-val warn">80 objects at 550 km</span></div>
+  <div class="hud-row"><span>Orbit Altitude</span><span class="hud-val">~550 km LEO</span></div>
+  <div class="hud-row"><span>Training Cycles</span><span class="hud-val ok">200 ✓</span></div>
+</div>
+
+<div id="legend">
+  <h3>HEALTH STATUS</h3>
+  <div class="leg-item"><div class="leg-dot" style="background:#1ef05a"></div> Nominal</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ffd200"></div> Degraded (low battery/fuel)</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ff3228"></div> Critical fault active</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#e619e6"></div> Safe mode</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#50b4ff"></div> Eclipse</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ff4614"></div> Debris object</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#ffd700; border-radius:0"></div> Ground station</div>
+</div>
+
+<script>
+// ── Free CesiumJS token (get yours at cesium.com/ion — it's free) ──
+Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYTU2YjlhOC0xMmNkLTQ1ZjAtOGU5OC0wNjBhYTVjZDI5OTAiLCJpZCI6MjU5LCJpYXQiOjE1MTgxNzI0NTN9.u4W4e2sfp6QSN32aTDGfAuiD6VPUj0LJlJBXNkNQ7c4';
+
+const viewer = new Cesium.Viewer('cesiumContainer', {
+    terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+    baseLayerPicker: false,
+    geocoder: false,
+    homeButton: false,
+    sceneModePicker: false,
+    navigationHelpButton: false,
+    animation: true,
+    timeline: true,
+    fullscreenButton: true,
+    imageryProvider: new Cesium.TileMapServiceImageryProvider({
+        url: Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII')
+    })
+});
+
+// Dark space background
+viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#040408');
+viewer.scene.skyBox.show = true;
+viewer.scene.sun.show = true;
+viewer.scene.moon.show = false;
+viewer.scene.globe.enableLighting = true;
+viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0d1a3a');
+
+// Load CZML
+const czmlDataSource = new Cesium.CzmlDataSource();
+czmlDataSource.load('outputs/constellation.czml').then(function(ds) {
+    viewer.dataSources.add(ds);
+    viewer.zoomTo(ds);
+}).otherwise(function(err) {
+    console.error('CZML load error:', err);
+    alert('Could not load constellation.czml\nMake sure it is in the outputs/ folder next to this HTML file.');
+});
+
+// Update HUD every second
+setInterval(function() {
+    const t = viewer.clock.currentTime;
+    if (t) {
+        const iso = Cesium.JulianDate.toIso8601(t, 0);
+        document.getElementById('hud-time').textContent = iso.split('T')[1].split('Z')[0];
+    }
+}, 1000);
+
+// Camera: start at nice angle
+viewer.camera.setView({
+    destination: Cesium.Cartesian3.fromDegrees(0, 20, 18000000),
+    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-45), roll: 0 }
+});
+</script>
+</body>
+</html>
