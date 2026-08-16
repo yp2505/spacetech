@@ -61,8 +61,8 @@ class TestFlightSafety(unittest.TestCase):
 
     def test_observation_adapter_matches_policy_schema(self):
         observation = AIObservationAdapter().build_observation(healthy_state(), False)
-        self.assertEqual(observation["local"].shape, (49,))
-        self.assertEqual(observation["global"].shape, (47,))
+        self.assertEqual(observation["local"].shape, (44,))
+        self.assertEqual(observation["global"].shape, (63,))
 
     def test_scheduler_rejects_invalid_task_rate(self):
         scheduler = CyclicScheduler(hz=10)

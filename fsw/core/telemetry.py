@@ -41,6 +41,7 @@ class ADCSTelemetry(TelemetryPoint):
     # Body frame (Roll, Pitch, Yaw in degrees for simplicity in this sim)
     attitude_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rates_deg_s: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    delta_v_remaining: float = 1000.0
     fuel_percent: float = 0.0
 
 @dataclass
@@ -63,7 +64,14 @@ class ISLNeighborState:
     battery_charge_percent: float = 0.0
     fuel_percent: float = 0.0
     isl_active: bool = False
-
+    
+    # Part 1: True ISL Data Exchange Additions
+    neighbor_temp_c: float = 0.0
+    data_buffer_gb: float = 0.0
+    task_queue_size: float = 0.0
+    last_episode_reward: float = 0.0
+    link_quality: float = 0.0
+    encrypted_payload: str = ""
 @dataclass
 class GlobalFleetState(TelemetryPoint):
     """Aggregate fleet telemetry, typically uplinked or derived via ISL mesh."""
@@ -90,6 +98,7 @@ class SubsystemState:
     # ISL/Network additions for the AI observation adapter
     neighbors: list[ISLNeighborState] = field(default_factory=list)
     global_fleet: GlobalFleetState = field(default_factory=GlobalFleetState)
+    commander_goal: tuple[float, float, float] = (0.0, 1.0, 0.0)
     
     @property
     def any_stale(self) -> bool:

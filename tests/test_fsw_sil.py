@@ -53,7 +53,7 @@ class TestFSWSIL(unittest.TestCase):
         
         # Now trigger the AI loop. Even if AI proposes thrust, the Arbiter should block it.
         # We manually propose thrust via the arbiter to test it
-        cmd_t, cmd_r, cmd_p, cmd_y = self.agent.ai.propose_action(self.agent.state, in_recovery=False)
+        cmd_t, cmd_r, cmd_p, cmd_y, _, _, _, _ = self.agent.ai.propose_action(self.agent.state, in_recovery=False)
         
         # Verify the HAL got 0 thrust
         thrust = self.adcs.last_command[0]

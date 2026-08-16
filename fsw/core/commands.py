@@ -17,6 +17,10 @@ class ActuatorCommand:
     roll_tq: float = 0.0
     pitch_tq: float = 0.0
     yaw_tq: float = 0.0
+    relay_action: float = 0.0
+    hohmann: float = 0.0
+    avoidance: float = 0.0
+    deorbit: float = 0.0
     
     # Metadata for tracing
     command_id: str = field(default_factory=lambda: uuid.uuid4().hex)

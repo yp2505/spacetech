@@ -37,9 +37,19 @@ class EpisodeRecord:
     steps:            int
     was_eclipse:      bool   = False
     was_weather:      bool   = False
-    was_fault:        bool   = False   # Phase E: episode had hardware fault injection
+    was_fault:        bool   = False
     salience:         float  = field(default=0.0, compare=False)
     start_conditions: dict   = field(default_factory=dict)
+    
+    # Part 5: New traces
+    satellite_id:        int = -1
+    orbital_state:       dict = field(default_factory=dict)
+    commander_goal:      list = field(default_factory=list)
+    action_sequence:     list = field(default_factory=list)
+    maneuver_performed:  str = ""
+    fuel_cost:           float = 0.0
+    data_routed_via_isl: bool = False
+    timestamp_step:      int = 0
 
 
 class EpisodicMemory:
@@ -217,7 +227,56 @@ class EpisodicMemory:
         except Exception as exc:
             print(f"[EpisodicMemory] ⚠ Could not load '{self.filepath}': {exc}. Starting fresh.")
 
+    def query_similar_episode(self, current_orbital_state: dict, threshold=0.8):
+        """
+        Cross-satellite memory query: finds a past episode with a highly similar
+        orbital state (true anomaly, altitude, eclipse).
+        Uses cosine similarity.
+        """
+        if not self.episodes:
+            return None
+        
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError:
+            return None
+            
+        def to_vec(state):
+            return np.array([[
+                state.get("true_anomaly", 0.0),
+                state.get("altitude_km", 500.0),
+                state.get("eclipse_fraction", 0.0)
+            ]])
+            
+        current_vec = to_vec(current_orbital_state)
+        
+        best_ep = None
+        best_sim = -1.0
+        
+        for ep in self.episodes:
+            if not ep.orbital_state:
+                continue
+            ep_vec = to_vec(ep.orbital_state)
+            sim = cosine_similarity(current_vec, ep_vec)[0][0]
+            if sim > best_sim and sim > threshold:
+                best_sim = sim
+                best_ep = ep
+                
+        return best_ep
+
     # ── summary ────────────────────────────────────────────────────────────────
+    def _recompute_stats(self) -> None:
+        """Recompute best/worst/total_seen from current episodes."""
+        if not self.episodes:
+            self.best_reward = -1e9
+            self.worst_reward = 1e9
+            self.total_seen = 0
+        else:
+            rewards = [e.total_reward for e in self.episodes]
+            self.best_reward = max(rewards)
+            self.worst_reward = min(rewards)
+            self.total_seen = max(e.episode_id for e in self.episodes)
+
     @property
     def stats(self) -> str:
         if not self.episodes:

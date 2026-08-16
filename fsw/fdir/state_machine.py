@@ -18,6 +18,7 @@ class OperatingMode(Enum):
     RECOVERY = 6
     GROUND_HOLD = 7
     EMERGENCY = 8
+    EOL_DEORBIT = 9   # End-of-Life: battery critically degraded → execute de-orbit
 
 class FDIRStateMachine:
     def __init__(self):
@@ -28,30 +29,36 @@ class FDIRStateMachine:
             "wheel_fault": 0,
             "thruster_fault": 0,
             "sensor_fault": 0,
-            "stale_telemetry": 0
+            "stale_telemetry": 0,
+            "eol_battery": 0,      # persistent critical-low battery counter
         }
-        self.persistence_threshold = 3 # Require 3 consecutive hits to latch fault
+        self.persistence_threshold = 3  # Require 3 consecutive hits to latch fault
+        self.eol_threshold = 20         # 20 consecutive cycles at < 15% → EOL
         self._latched_faults = set()
 
     def update(self, state: 'SubsystemState') -> OperatingMode:
         """Evaluate subsystem state and transition operating modes."""
-        
+
+        # ── EOL is terminal — once entered we never leave ─────────────────────
+        if self.mode == OperatingMode.EOL_DEORBIT:
+            return self.mode
+
         # 1. Evaluate primitive faults and decay when clear
         if state.eps.battery_charge_percent < 20.0:
             self.fault_counters["low_battery"] += 1
         else:
             self.fault_counters["low_battery"] = max(0, self.fault_counters["low_battery"] - 1)
-            
+
         if state.thermal.battery_temp_c > 50.0:
             self.fault_counters["over_temp"] += 1
         else:
             self.fault_counters["over_temp"] = max(0, self.fault_counters["over_temp"] - 1)
-            
+
         if state.faults.wheel_fault:
             self.fault_counters["wheel_fault"] += 1
         else:
             self.fault_counters["wheel_fault"] = max(0, self.fault_counters["wheel_fault"] - 1)
-            
+
         if state.faults.thruster_fault:
             self.fault_counters["thruster_fault"] += 1
         else:
@@ -61,21 +68,42 @@ class FDIRStateMachine:
             self.fault_counters["sensor_fault"] += 1
         else:
             self.fault_counters["sensor_fault"] = max(0, self.fault_counters["sensor_fault"] - 1)
-            
+
         if state.any_stale:
             self.fault_counters["stale_telemetry"] += 1
         else:
             self.fault_counters["stale_telemetry"] = max(0, self.fault_counters["stale_telemetry"] - 1)
 
+        # ── EOL battery degradation counter ──────────────────────────────────
+        # If battery is critically low (< 15%) for eol_threshold consecutive
+        # cycles we declare End-of-Life and initiate the de-orbit sequence.
+        EOL_BAT_THRESH = 15.0
+        if state.eps.battery_charge_percent < EOL_BAT_THRESH:
+            self.fault_counters["eol_battery"] += 1
+            if self.fault_counters["eol_battery"] >= self.eol_threshold:
+                logging.critical(
+                    "FDIR: EOL condition confirmed — battery < %.0f%% for %d consecutive cycles. "
+                    "Initiating EOL_DEORBIT sequence.",
+                    EOL_BAT_THRESH, self.eol_threshold
+                )
+                self.mode = OperatingMode.EOL_DEORBIT
+                return self.mode
+        else:
+            # Reset EOL counter only if battery recovers above threshold
+            self.fault_counters["eol_battery"] = max(
+                0, self.fault_counters["eol_battery"] - 1
+            )
+
         # 2. Latch persistent faults
         for fault_name, count in self.fault_counters.items():
-            if count >= self.persistence_threshold and fault_name not in self._latched_faults:
-                logging.error(f"FDIR: Latched critical fault: {fault_name}")
+            if (fault_name != "eol_battery"
+                    and count >= self.persistence_threshold
+                    and fault_name not in self._latched_faults):
+                logging.error("FDIR: Latched critical fault: %s", fault_name)
                 self._latched_faults.add(fault_name)
 
         # 3. Mode transitions
         if self.mode in [OperatingMode.BOOT, OperatingMode.COMMISSIONING]:
-            # Initial startup sequence finishes when faults are clear
             if not self._latched_faults:
                 self.mode = OperatingMode.NOMINAL
 
@@ -88,18 +116,17 @@ class FDIRStateMachine:
                 if self.mode not in [OperatingMode.SAFE_MODE, OperatingMode.RECOVERY, OperatingMode.GROUND_HOLD]:
                     logging.warning("FDIR: Entering DEGRADED mode due to component fault.")
                     self.mode = OperatingMode.DEGRADED
-                    
+
         elif self.mode == OperatingMode.RECOVERY:
-            # We are in recovery and latched faults are clear.
-            # Only return to nominal if telemetry is completely healthy and not stale.
+            # Only return to nominal when all fault counters are zero and telemetry fresh
             if sum(self.fault_counters.values()) == 0 and not state.any_stale:
                 logging.info("FDIR: Recovery criteria met. Returning to NOMINAL.")
                 self.mode = OperatingMode.NOMINAL
-                
+
         elif self.mode == OperatingMode.DEGRADED and not self._latched_faults:
             logging.info("FDIR: Degraded condition cleared. Returning to NOMINAL.")
             self.mode = OperatingMode.NOMINAL
-                    
+
         return self.mode
 
     def ground_command_clear_fault(self, fault_name: str, *, authenticated: bool = False) -> bool:

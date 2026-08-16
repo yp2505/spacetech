@@ -28,7 +28,7 @@ class AIObservationAdapter:
         """
         Builds the Dict space for SB3 inference.
         Returns:
-            {"local": ndarray(49), "global": ndarray(47)}
+            {"local": ndarray(44), "global": ndarray(47)}
         Note: The 4-dim memory context must be appended by the agent if required.
         """
         
@@ -44,21 +44,28 @@ class AIObservationAdapter:
         for i, d_pos in enumerate(state.global_fleet.debris_positions[:3]):
             deb[i] = d_pos / 360.0
 
+        # Part 2 & 4 implementation
+        min_deb_dist = 1.0
+        for d_pos in state.global_fleet.debris_positions[:3]:
+            dist = min(abs(obs_pos * 360.0 - d_pos), 360.0 - abs(obs_pos * 360.0 - d_pos)) / 180.0
+            if dist < min_deb_dist:
+                min_deb_dist = dist
+
+        # Fetch commander goal if present, otherwise default to nominal
+        commander_goal = getattr(state, "commander_goal", [0.0, 1.0, 0.0])
+
         base_local = np.array([
-            (obs_pos % 360.0) / 360.0,
-            np.clip(closing_rate / 3.0, -1, 1),
-            np.clip(state.adcs.fuel_percent / 100.0, 0.0, 1.0),
-            state.eps.battery_charge_percent / 100.0,
-            0.0, # Gap error (mocked 0 for standalone FSW logic)
-            deb[0], deb[1], deb[2],
-            eclipse_flag,
-            float(state.global_fleet.space_weather_active),
-            np.clip(state.thermal.battery_temp_c / 100.0, -2.0, 2.0),
-            np.clip(state.comms.data_buffer_gb / (self.config.data_capacity_gb + 1e-6), 0.0, 1.0),
-            float(state.faults.wheel_fault),
-            float(state.faults.thruster_fault),
-            float(state.faults.sensor_fault),
-            float(state.comms.has_ground_los),
+            (obs_pos % 360.0) / 360.0,                                      # 0: true_anomaly
+            self.config.orbit.altitude_km / 10000.0,                        # 1: altitude_km
+            eclipse_flag,                                                   # 2: eclipse_fraction
+            float(state.comms.has_ground_los),                              # 3: ground_station_los
+            min_deb_dist,                                                   # 4: debris_proximity
+            getattr(state.adcs, "delta_v_remaining", 1000.0) / 1000.0,      # 5: delta_v_remaining
+            np.clip(state.thermal.battery_temp_c / 100.0, -2.0, 2.0),       # 6: thermal_state
+            state.eps.battery_charge_percent / 100.0,                       # 7: battery_soc
+            commander_goal[0],                                              # 8: cmdr_goal_1
+            commander_goal[1],                                              # 9: cmdr_goal_2
+            commander_goal[2],                                              # 10: cmdr_goal_3
         ], dtype=np.float32)
 
         # 2. Attitude (6 dims)
@@ -88,7 +95,7 @@ class AIObservationAdapter:
         # 4. Recovery Flag (1 dim)
         recovery_flag = np.array([float(is_in_recovery)], dtype=np.float32)
 
-        # LOCAL: 16 + 6 + 20 + 6 + 1 = 49
+        # LOCAL: 11 + 6 + 20 + 6 + 1 = 44
         local_obs = np.concatenate([
             base_local, att, neigh_feat, self.config_vec, recovery_flag
         ]).astype(np.float32)
@@ -104,9 +111,22 @@ class AIObservationAdapter:
             np.clip(state.comms.data_buffer_gb / (self.config.data_capacity_gb + 1e-6), 0.0, 1.0),
         ], dtype=np.float32)
 
-        # 6. Global Neighbors (24 dims)
+        # 6. Global Neighbors (40 dims)
         n_global = []
         for n in state.neighbors[:self.max_neighbors]:
+            import base64
+            # Decrypt payload to ensure security
+            key = 0xAA
+            valid_decryption = 0.0
+            if n.encrypted_payload:
+                try:
+                    raw_bytes = base64.b64decode(n.encrypted_payload)
+                    decrypted = bytearray([b ^ key for b in raw_bytes]).decode()
+                    if decrypted.startswith("SAT_"):
+                        valid_decryption = 1.0
+                except:
+                    pass
+
             n_pos = n.position_eci_km[0] / 100.0
             n_vel = n.velocity_eci_kms[0]
             n_closing = n_vel - self.nominal_vel
@@ -115,11 +135,15 @@ class AIObservationAdapter:
                 np.clip(n_closing / 3.0, -1.0, 1.0),
                 n.fuel_percent / 100.0,
                 n.battery_charge_percent / 100.0,
-                0.0, # neighbor temp not shared in ISL mock currently
-                0.0, # neighbor data not shared in ISL mock currently
+                np.clip(n.neighbor_temp_c / 100.0, -2.0, 2.0),
+                np.clip(n.data_buffer_gb / (self.config.data_capacity_gb + 1e-6), 0.0, 1.0),
+                n.task_queue_size / 10.0,
+                n.last_episode_reward / 100.0,
+                n.link_quality,
+                valid_decryption
             ])
-        while len(n_global) < (self.max_neighbors * 6):
-            n_global.extend([0.0] * 6)
+        while len(n_global) < (self.max_neighbors * 10):
+            n_global.extend([0.0] * 10)
 
         # 7. Global Stats (6 dims)
         global_stats = np.array([
@@ -137,11 +161,11 @@ class AIObservationAdapter:
             state.global_fleet.eclipse_fraction,
         ], dtype=np.float32)
 
-        # GLOBAL: 6 + 24 + 6 + 3 + 2 + 6 = 47
+        # GLOBAL: 6 + 40 + 6 + 3 + 2 + 6 = 63
         global_obs = np.concatenate([
             own_feat, n_global, global_stats, deb, weather_eclipse, self.config_vec
         ]).astype(np.float32)
 
-        if local_obs.shape != (49,) or global_obs.shape != (47,):
-            raise ValueError("AI observation schema mismatch")
+        if local_obs.shape != (44,) or global_obs.shape != (63,):
+            raise ValueError(f"AI observation schema mismatch. Local: {local_obs.shape}, Global: {global_obs.shape}")
         return {"local": local_obs, "global": global_obs}
