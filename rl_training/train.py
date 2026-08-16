@@ -28,6 +28,7 @@ Usage:
 
 import os
 import sys
+import copy
 import argparse
 from dataclasses import replace
 import numpy as np
@@ -56,9 +57,9 @@ from fsw.hal.isl_mesh import ISLMeshNetwork
 CYCLES          = 200       # Training cycles
 STEPS_PER_CYCLE = 5_000     # Steps per cycle per agent
 EWC_LAMBDA      = 5_000.0   # EWC regularization strength
-MODEL_PATH      = "ppo_swarm_brain"
+MODEL_PATH      = "ppo_swarm_brain.bin"
 EWC_PATH        = "ewc_fisher_swarm.pkl"
-PHASE_B_ZIP     = "checkpoints/phase_b_archive/ppo_swarm_brain.zip"
+PHASE_B_ZIP     = "checkpoints/phase_b_archive/ppo_swarm_brain.bin"
 USE_MAPPO       = False     # Use MAPPO (shared critic)
 USE_IPPO        = False     # Use IPPO (independent critics)
 PARAM_SHARING   = True      # Parameter sharing across agents
@@ -83,6 +84,73 @@ def curriculum_phase(cycle: int) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Model factory
 # ─────────────────────────────────────────────────────────────────────────────
+def _compute_ppo_n_steps(num_envs: int, env_max_steps: int = 360) -> int:
+    """Compute PPO rollout length while ensuring episodes are not truncated."""
+    n_steps = max(512, 4096 // max(1, int(num_envs)))
+    
+    # Scale down for quick tests
+    if STEPS_PER_CYCLE < 4096:
+        n_steps = max(10, STEPS_PER_CYCLE // max(1, int(num_envs)))
+        
+    if n_steps < env_max_steps and STEPS_PER_CYCLE >= 4096:
+        raise ValueError(
+            "PPO rollout length is too short for the environment: "
+            f"n_steps={n_steps} < env.max_steps={env_max_steps} "
+            f"(N_ENVS={num_envs}, rollout_buffer_target=4096). "
+            "Increase N_ENVS or configure a longer PPO rollout so episodes are not truncated silently."
+        )
+    return n_steps
+
+
+def _enforce_rollout_length(num_envs: int, env_max_steps: int = 360) -> int:
+    """Fail fast if PPO rollout length would truncate episodes on the current env."""
+    return _compute_ppo_n_steps(num_envs, env_max_steps=env_max_steps)
+
+
+class DetachedPolicyProxy:
+    """Picklable policy snapshot for self-play in SubprocVecEnv workers."""
+
+    def __init__(self, policy):
+        self.policy_cls = policy.__class__
+        self.observation_space = policy.observation_space
+        self.action_space = policy.action_space
+        self.lr_schedule = _constant_lr_schedule
+        self.state_dict = {
+            key: value.detach().cpu().clone() for key, value in policy.state_dict().items()
+        }
+
+    def _rebuild(self):
+        model = self.policy_cls(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            lr_schedule=self.lr_schedule,
+        )
+        model.load_state_dict(self.state_dict)
+        model.to("cpu")
+        model.eval()
+        return model
+
+    def predict(self, observation, deterministic=True, state=None, episode_start=None, **kwargs):
+        model = self._rebuild()
+        with torch.no_grad():
+            return model.predict(
+                observation,
+                deterministic=deterministic,
+                state=state,
+                episode_start=episode_start,
+                **kwargs,
+            )
+
+
+def _constant_lr_schedule(_):
+    return 0.0
+
+
+def _detach_policy_for_worker(policy):
+    """Create a process-safe inference snapshot for SubprocVecEnv workers."""
+    return DetachedPolicyProxy(policy)
+
+
 def build_or_load_model(env, continue_training: bool = False, train_env=None) -> tuple[PPO, bool]:
     """
     Returns (model, is_new). 
@@ -95,26 +163,29 @@ def build_or_load_model(env, continue_training: bool = False, train_env=None) ->
                    If provided, the model is created with this env so n_envs matches.
     """
     _env = train_env if train_env is not None else env
+    _env_max_steps = getattr(_env, 'max_steps', getattr(env, 'max_steps', 360))
+    _enforce_rollout_length(N_ENVS, env_max_steps=_env_max_steps)
 
-    if continue_training and os.path.exists(MODEL_PATH + ".zip"):
-        print(f"  ✓ Loading existing Swarm Brain from {MODEL_PATH}.zip for continued training")
+    if continue_training and os.path.exists(MODEL_PATH):
+        print(f"  ✓ Loading existing Swarm Brain from {MODEL_PATH} for continued training")
         model = PPO.load(MODEL_PATH, env=_env)
         return model, False
 
-    if not continue_training and os.path.exists(MODEL_PATH + ".zip") and not os.path.exists(EWC_PATH):
-        print(f"  ✓ Loading existing Swarm Brain from {MODEL_PATH}.zip (no EWC yet)")
+    if not continue_training and os.path.exists(MODEL_PATH) and not os.path.exists(EWC_PATH):
+        print(f"  ✓ Loading existing Swarm Brain from {MODEL_PATH} (no EWC yet)")
         model = PPO.load(MODEL_PATH, env=_env)
         return model, False
 
     print(f"  Creating new Phase C-F Universal Swarm Brain... [device={DEVICE}]")
-    # n_steps auto-scales with N_ENVS: total samples per update ≈ 4096
-    _n_steps = max(512, 4096 // max(1, N_ENVS))
+    _n_steps = _enforce_rollout_length(N_ENVS, env_max_steps=_env_max_steps)
+    _batch_size = min(512, _n_steps * N_ENVS)
+
     model = PPO(
         CTDEPolicy, _env,
         verbose=0,
         learning_rate=3e-4,
         n_steps=_n_steps,
-        batch_size=512,
+        batch_size=_batch_size,
         n_epochs=10,
         gamma=0.995,
         gae_lambda=0.95,
@@ -352,6 +423,9 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
     env = SingleAgentWrapper(config=config, max_steps=360, agent_idx=0, memory=primary_memory)
     env.env.episodic_memory = primary_memory
 
+    # NOTE: SubprocVecEnv workers do NOT share the same Python object graph. The
+    # memory closure is deep-copied per worker process, so true cross-process
+    # sharing is simulated after each cycle via _simulate_training_gossip().
     # ── SubprocVecEnv for parallel rollout collection ──────────────────────
     # SB3's model.learn() drives the VecEnv; using SubprocVecEnv runs physics
     # in separate CPU processes, keeping the GPU feed-forward pipeline busy.
@@ -370,7 +444,9 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
         print("  DummyVecEnv: single-core mode")
 
     model, is_new = build_or_load_model(env, continue_training, train_env=train_env)
-    env.set_other_model(model)   # self-play on the serial env
+    worker_policy = _detach_policy_for_worker(model.policy)
+    env.set_other_model(worker_policy)  # self-play on the serial env
+    train_env.env_method("set_other_model", worker_policy)  # propagate the live policy into each worker
 
     # Start gossip threads AFTER all process forks
     constellation_gossip.start_all()
@@ -391,7 +467,10 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
     print("\n" + "=" * 68)
     print(f"  CO-TRAINING: {CYCLES} cycles × {STEPS_PER_CYCLE:,} steps "
           f"= {CYCLES*STEPS_PER_CYCLE:,} total steps")
-    print("  Distributed Memory Gossip: ACTIVE (fanout=2, interval=5s)")
+    print("  Distributed Memory Gossip: SIMULATED POST-HOC (fanout=2, interval=5s)")
+    print("  Note: primary_memory is deep-copied per worker process and is not actually shared")
+    print("        across SubprocVecEnv workers during training; the shared-memory effect is")
+    print("        simulated at the end of each cycle via _simulate_training_gossip().")
     print("=" * 68)
 
     header = f"\n  {'Cycle':>5}  {'Max Rew':>10}  {'Mean Rew':>10}  "
@@ -402,8 +481,11 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
     for cycle in range(1, CYCLES + 1):
         phase = curriculum_phase(cycle)
         env.set_curriculum_phase(phase)
-        # Propagate phase to all SubprocVecEnv / DummyVecEnv workers
+        # Propagate phase and updated policy to all parallel workers
+        worker_policy = _detach_policy_for_worker(model.policy)
         train_env.env_method("set_curriculum_phase", phase)
+        train_env.env_method("set_other_model", worker_policy)
+        env.set_other_model(worker_policy)
 
         # Train using the vectorized env (SubprocVecEnv or DummyVecEnv)
         model.learn(total_timesteps=STEPS_PER_CYCLE, reset_num_timesteps=False)
@@ -424,7 +506,18 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
             max_r = float(np.max([ep["r"] for ep in buf]))
             mean_r = float(np.mean([ep["r"] for ep in buf]))
         else:
-            max_r = mean_r = 0.0
+            import warnings
+            _env_max_steps = getattr(env, 'max_steps', 360)
+            warnings.warn(
+                "ep_info_buffer is empty after this cycle; this is not a real zero-reward episode. "
+                f"model.n_steps={getattr(model, 'n_steps', 'unknown')}, N_ENVS={N_ENVS}, "
+                f"env.max_steps={_env_max_steps}, total_timesteps={STEPS_PER_CYCLE}. "
+                "Check that PPO rollout length is long enough to complete each episode and that "
+                "all workers received the live model for self-play.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            max_r = mean_r = float("nan")
 
         # V(s) confidence estimate
         vs = []
@@ -531,7 +624,7 @@ def run_multiagent_training(config, memory, ewc, eval_only, fast_eval=False):
     print("\n" + "=" * 68)
     print(f"  BASELINE: Evaluating initial model ({'fast: 1 ep' if fast_eval else '5 episodes'})...")
     print("=" * 68)
-    b_coll, b_fuel, b_rew = [[0]*_eval_eps]*10, [[0]*_eval_eps]*10, [[0]*_eval_eps]*10
+    b_coll, b_fuel, b_rew = run_ma_evaluation(models, config, memory, num_episodes=_eval_eps)
     print_ma_summary("BASELINE", config, b_coll, b_fuel, b_rew)
     
     if eval_only:
@@ -578,8 +671,19 @@ def run_multiagent_training(config, memory, ewc, eval_only, fast_eval=False):
             max_r = float(np.max([ep["r"] for ep in buf]))
             mean_r = float(np.mean([ep["r"] for ep in buf]))
         else:
-            max_r = mean_r = 0.0
-        
+            import warnings
+            _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
+            warnings.warn(
+                "ep_info_buffer is empty after this cycle; this is not a real zero-reward episode. "
+                f"model.n_steps={getattr(models[0], 'n_steps', 'unknown')}, N_ENVS={env_wrapper.n_envs}, "
+                f"env.max_steps={_env_max_steps}, total_timesteps={STEPS_PER_CYCLE}. "
+                "Check that PPO rollout length is long enough to complete each episode and that "
+                "all workers received the live model for self-play.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            max_r = mean_r = float("nan")
+
         print(f"  {cycle:>5}  {max_r:>+10.3f}  {mean_r:>+10.3f}  Ph {phase:>1}", flush=True)
     
     # Compute EWC Fisher

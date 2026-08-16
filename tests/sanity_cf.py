@@ -5,7 +5,7 @@ import rl_training.train as train
 
 def main() -> None:
     # This intentionally moves existing artefacts, so it is only run explicitly.
-    for f in ["ppo_swarm_brain.zip", "ewc_fisher_swarm.pkl", "episodic_memory.pkl"]:
+    for f in ["ppo_swarm_brain.bin", "ewc_fisher_swarm.pkl", "episodic_memory.pkl"]:
         if os.path.exists(f):
             shutil.move(f, f + ".phase_b.bak")
             print(f"Moved {f} to backup.")

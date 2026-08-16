@@ -149,7 +149,7 @@ class CTDEPolicy(ActorCriticPolicy):
             values    = self.value_net(latent_vf)
         return float(values.mean().item())
 
-def load_old_weights_with_padding(model, old_model_path="ppo_satellite_1.zip"):
+def load_old_weights_with_padding(model, old_model_path="ppo_satellite_1.bin"):
     """
     Safely load old 15/13-dim model weights into the new 46/31-dim model.
     The new inputs (neighbor states, attitude) will have weights initialized to zero,

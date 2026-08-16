@@ -13,7 +13,15 @@ import torch
 print("🚀 GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "❌ NO GPU FOUND")
 
 # ── 1b. Copy your dataset into the working directory ──────
-SRC = "/kaggle/input/spacetechs"          # change to your actual dataset name if different
+SRC = None
+for root, dirs, files in os.walk("/kaggle/input"):
+    if "rl_training" in dirs:
+        SRC = root
+        break
+
+if not SRC:
+    raise FileNotFoundError("Could not find the spacetech project folder in /kaggle/input. Did you attach the dataset?")
+
 DST = "/kaggle/working/spacetech"
 if os.path.exists(DST):
     shutil.rmtree(DST)
@@ -31,13 +39,24 @@ subprocess.run([
 ], check=True)
 print("✅ Dependencies installed!")
 
-# ── 1d. Confirm old-brain checkpoint is present ──────────
-CHECKPOINT = "checkpoints/phase_b_archive/ppo_swarm_brain.zip"
-if os.path.exists(CHECKPOINT):
-    size_mb = os.path.getsize(CHECKPOINT) / 1e6
-    print(f"✅ Old brain found ({size_mb:.1f} MB) — Transfer learning ENABLED (AI builds on old knowledge!)")
-else:
-    print("⚠️  Old brain NOT found — Will train from scratch")
+# ── 1d. Auto-load previous Continual Learning weights ─────
+found_continual = False
+for root, dirs, files in os.walk("/kaggle/input"):
+    if "ppo_swarm_brain.bin" in files and "phase_b_archive" not in root:
+        print(f"🔄 Found Continual Learning weights in {root}! Copying...")
+        shutil.copy2(os.path.join(root, "ppo_swarm_brain.bin"), DST)
+        if "ewc_fisher_swarm.pkl" in files:
+            shutil.copy2(os.path.join(root, "ewc_fisher_swarm.pkl"), DST)
+        found_continual = True
+        break
+
+if not found_continual:
+    CHECKPOINT = "checkpoints/phase_b_archive/ppo_swarm_brain.bin"
+    if os.path.exists(CHECKPOINT):
+        size_mb = os.path.getsize(CHECKPOINT) / 1e6
+        print(f"✅ Baseline Phase B brain found ({size_mb:.1f} MB) — Transfer learning ENABLED")
+    else:
+        print("⚠️  Old brain NOT found — Will train from scratch")
 
 # ── 1e. Launch training ───────────────────────────────────
 # MAPPO mode: 10 satellites share one brain, 200 cycles x 5000 steps = 1M total steps
@@ -63,7 +82,7 @@ if os.path.exists(OUTPUT_ZIP):
     os.remove(OUTPUT_ZIP)
 
 patterns = [
-    "ppo_swarm_brain.zip",
+    "ppo_swarm_brain.bin",
     "ewc_fisher_swarm.pkl",
     "episodic_memory*.pkl",
     "outputs/reward_history.csv",

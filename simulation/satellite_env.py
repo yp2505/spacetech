@@ -158,7 +158,8 @@ class SingleAgentWrapper(gym.Env):
         return {"local": local, "global": base_obs["global"]}
 
     def set_other_model(self, model):
-        self.other_model = model
+        """Set the peer policy for self-play. Accept either a PPO model or its policy object."""
+        self.other_model = getattr(model, "policy", model)
 
     def set_curriculum_phase(self, p: int):
         self.curriculum_phase = p

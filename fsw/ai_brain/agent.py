@@ -15,7 +15,7 @@ from simulation.sat_config import SatelliteConfig
 from fsw.core.watchdog import WatchdogManager
 
 class AIBrain:
-    def __init__(self, model_path: str = "ppo_swarm_brain.zip", config: Optional[SatelliteConfig] = None, memory=None, watchdog: Optional[WatchdogManager] = None):
+    def __init__(self, model_path: str = "ppo_swarm_brain.bin", config: Optional[SatelliteConfig] = None, memory=None, watchdog: Optional[WatchdogManager] = None):
         self.model_path = model_path
         self.model = None
         self.is_loaded = False

@@ -16,7 +16,7 @@ class CyclicScheduler:
         self.hz = hz
         self.period = 1.0 / hz
         self.tasks = []
-        self.watchdog = WatchdogManager(timeout_sec=self.period * 5)
+        self.watchdog = WatchdogManager(default_timeout_sec=self.period * 5)
         self.running = False
 
     def add_task(self, name: str, func, frequency_hz: int):

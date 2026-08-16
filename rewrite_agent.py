@@ -4,14 +4,15 @@ with open("fsw/ai_brain/agent.py", "r") as f:
     content = f.read()
 
 # Add memory to AIBrain
-old_init = """    def __init__(self, model_path: str = "ppo_swarm_brain.zip", config: Optional[SatelliteConfig] = None):
-        self.model_path = model_path
-        self.model = None
-        self.is_loaded = False
-        self.obs_adapter = AIObservationAdapter(config=config)
-        self._load_model()"""
+old_init = """    def __init__(self, model_path: str = "ppo_swarm_brain.bin", config: Optional[SatelliteConfig] = None):
+        if config is None:
+            config = PRESETS["starlink_leo"]
+        self.config = config
+        self.agent_idx = 0
+        self.env = SingleAgentWrapper(config=self.config, max_steps=1, agent_idx=self.agent_idx)
+        self.model = PPO.load(model_path, env=self.env)"""
 
-new_init = """    def __init__(self, model_path: str = "ppo_swarm_brain.zip", config: Optional[SatelliteConfig] = None, memory=None):
+new_init = """    def __init__(self, model_path: str = "ppo_swarm_brain.bin", config: Optional[SatelliteConfig] = None, memory=None):
         self.model_path = model_path
         self.model = None
         self.is_loaded = False

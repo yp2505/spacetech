@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.utils import obs_as_tensor
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -46,9 +47,9 @@ from gymnasium import spaces
 CYCLES = 200
 STEPS_PER_CYCLE = 5_000
 EWC_LAMBDA = 5_000.0
-MODEL_PATH = "ppo_swarm_brain"
+MODEL_PATH = "ppo_swarm_brain.bin"
 EWC_PATH = "ewc_fisher_swarm.pkl"
-PHASE_B_ZIP = "checkpoints/phase_b_archive/ppo_swarm_brain.zip"
+PHASE_B_ZIP = "checkpoints/phase_b_archive/ppo_swarm_brain.bin"
 
 # MAPPO specific
 USE_MAPPO = True          # True=MAPPO (shared critic), False=IPPO (independent critics)
@@ -260,10 +261,11 @@ class MultiAgentEnvWrapper:
         # Total parallel workers = n_envs * num_satellites
         def make_env(env_idx: int, agent_idx: int):
             def _init():
-                return SingleAgentWrapper(
+                env = SingleAgentWrapper(
                     config=config, max_steps=max_steps,
                     agent_idx=agent_idx, memory=memory,
                 )
+                return Monitor(env)
             return _init
         
         # Create all environment factories
@@ -342,14 +344,21 @@ class MAPPOCallback(BaseCallback):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main Training Loop
 # ─────────────────────────────────────────────────────────────────────────────
+def _enforce_rollout_length(num_envs: int, env_max_steps: int = 360) -> int:
+    n_steps = max(512, 4096 // max(1, int(num_envs)))
+    if STEPS_PER_CYCLE < 4096:
+        n_steps = max(10, STEPS_PER_CYCLE // max(1, int(num_envs)))
+    return n_steps
+
 def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteConfig) -> List[PPO]:
     """Build or load models for each agent (or shared model with parameter sharing)."""
+    _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
     models = []
     
     if PARAMETER_SHARING:
         # Single shared model for all agents
-        if os.path.exists(MODEL_PATH + ".zip"):
-            print(f"  ✓ Loading shared MAPPO model from {MODEL_PATH}.zip")
+        if os.path.exists(MODEL_PATH):
+            print(f"  ✓ Loading shared MAPPO model from {MODEL_PATH}")
             from rl_training.ctde_policy import CTDEPolicy
             model = PPO.load(MODEL_PATH, env=env_wrapper.vec_env, custom_objects={'policy_class': MAPPOPolicy})
             # Replicate for each agent (same model reference)
@@ -364,7 +373,8 @@ def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteCon
             # busy simultaneously.  n_steps × n_envs = total rollout buffer
             # size per gradient update; we auto-scale n_steps to keep the
             # total ~4096 regardless of how many envs are active.
-            _n_steps = max(512, 4096 // max(1, env_wrapper.n_envs))
+            _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
+            _n_steps = _enforce_rollout_length(env_wrapper.n_envs, env_max_steps=_env_max_steps)
             model = PPO(
                 MAPPOPolicy, env_wrapper.vec_env,
                 verbose=0,
@@ -390,14 +400,15 @@ def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteCon
     else:
         # Independent model per agent
         for agent_idx in range(config.num_satellites):
-            model_path = f"{MODEL_PATH}_sat{agent_idx}.zip"
+            model_path = f"ppo_swarm_brain_sat{agent_idx}.bin"
             if os.path.exists(model_path):
                 print(f"  ✓ Loading agent {agent_idx} model from {model_path}")
                 from rl_training.ctde_policy import CTDEPolicy
                 model = PPO.load(model_path, env=env_wrapper.vec_env, custom_objects={'policy_class': MAPPOPolicy})
             else:
                 print(f"  Creating new model for agent {agent_idx}...")
-                _n_steps = max(512, 4096 // max(1, env_wrapper.n_envs))
+                _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
+                _n_steps = _enforce_rollout_length(env_wrapper.n_envs, env_max_steps=_env_max_steps)
                 model = PPO(
                     MAPPOPolicy, env_wrapper.vec_env,
                     verbose=0,
@@ -602,7 +613,18 @@ def main():
             max_r = float(np.max([ep["r"] for ep in buf]))
             mean_r = float(np.mean([ep["r"] for ep in buf]))
         else:
-            max_r = mean_r = 0.0
+            import warnings
+            _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
+            warnings.warn(
+                "ep_info_buffer is empty after this cycle; this is not a real zero-reward episode. "
+                f"model.n_steps={getattr(models[0], 'n_steps', 'unknown')}, N_ENVS={env_wrapper.n_envs}, "
+                f"env.max_steps={_env_max_steps}, total_timesteps={STEPS_PER_CYCLE}. "
+                "Check that PPO rollout length is long enough to complete each episode and that "
+                "all workers received the live model for self-play.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            max_r = mean_r = float("nan")
         
         print(f"  {cycle:>5}  {max_r:>+10.3f}  {mean_r:>+10.3f}  {'N/A':>8}  Ph {phase:>1}")
     
