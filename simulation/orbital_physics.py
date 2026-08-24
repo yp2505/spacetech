@@ -5,14 +5,162 @@ Phase C-F: Orbital Physics Engine.
 Includes 3D Keplerian mapping, Ground Station LOS (Line-of-Sight) math,
 and Multi-plane Walker Delta constellation distribution.
 
+Step E upgrades:
+- sgp4_propagate(): Real TLE-based orbit propagation (sgp4 library)
+- skyfield_eclipse_check(): Precise Sun/Earth/shadow geometry (Skyfield)
+- skyfield_los_check(): Accurate topocentric elevation for ground station LOS
+All three degrade gracefully to the original math if the libraries are absent.
+
 Fixed: inclination is now stored per-satellite in walker params and passed
 correctly to anomaly_to_ecef().
 """
 
+import math
 import numpy as np
+import datetime
+
+# ── sgp4 integration (Step E) ────────────────────────────────────────────────
+try:
+    from sgp4.api import Satrec, WGS72
+    _SGP4_AVAILABLE = True
+except ImportError:
+    _SGP4_AVAILABLE = False
+
+# ── Skyfield integration (Step E) ────────────────────────────────────────────
+try:
+    from skyfield.api import load, wgs84, EarthSatellite
+    from skyfield.framelib import ecliptic_frame
+    _ts = load.timescale()
+    _SKYFIELD_AVAILABLE = True
+except Exception:
+    _SKYFIELD_AVAILABLE = False
+
 
 EARTH_RADIUS_KM = 6371.0
 EARTH_MU        = 398600.4418
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Step E: sgp4 Orbit Propagator
+# ─────────────────────────────────────────────────────────────────────────────
+def sgp4_propagate(
+    tle_line1: str,
+    tle_line2: str,
+    minutes_since_epoch: float,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """
+    Propagate a satellite position and velocity using the real SGP4 algorithm.
+
+    Args:
+        tle_line1:             TLE line 1 string (69 chars)
+        tle_line2:             TLE line 2 string (69 chars)
+        minutes_since_epoch:   Minutes elapsed since the TLE epoch
+
+    Returns:
+        (pos_km, vel_km_s): TEME-frame position (km) and velocity (km/s)
+        or (None, None) if sgp4 is not available or TLE is invalid.
+    """
+    if not _SGP4_AVAILABLE:
+        return None, None
+    try:
+        sat = Satrec.twoline2rv(tle_line1, tle_line2)
+        # sgp4 wants whole minutes + fractional days offset
+        whole_min = int(minutes_since_epoch)
+        frac_day  = (minutes_since_epoch - whole_min) / 1440.0
+        e, pos, vel = sat.sgp4(0.0, minutes_since_epoch / 1440.0)
+        if e != 0:
+            return None, None
+        return np.array(pos), np.array(vel)
+    except Exception:
+        return None, None
+
+
+def teme_to_ecef(pos_teme: np.ndarray, gst_rad: float) -> np.ndarray:
+    """
+    Rotate a TEME (True Equator Mean Equinox) position vector to ECEF.
+
+    Args:
+        pos_teme:  (3,) position vector in km, TEME frame
+        gst_rad:   Greenwich Sidereal Time in radians
+
+    Returns:
+        (3,) position vector in km, ECEF frame
+    """
+    cos_g = math.cos(gst_rad)
+    sin_g = math.sin(gst_rad)
+    x_ecef =  cos_g * pos_teme[0] + sin_g * pos_teme[1]
+    y_ecef = -sin_g * pos_teme[0] + cos_g * pos_teme[1]
+    z_ecef =  pos_teme[2]
+    return np.array([x_ecef, y_ecef, z_ecef])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Step E: Skyfield Eclipse & LOS
+# ─────────────────────────────────────────────────────────────────────────────
+def skyfield_eclipse_check(
+    tle_line1: str,
+    tle_line2: str,
+    t_utc: datetime.datetime,
+) -> tuple[bool, float]:
+    """
+    Check whether the satellite is in Earth's shadow using Skyfield's precise
+    Sun/Earth/shadow geometry.
+
+    Args:
+        tle_line1, tle_line2: TLE strings
+        t_utc:               UTC datetime for the check
+
+    Returns:
+        (is_eclipse, shadow_fraction)  — fraction 0.0 (sunlit) to 1.0 (full shadow)
+        Falls back to (None, None) if Skyfield is unavailable.
+    """
+    if not _SKYFIELD_AVAILABLE:
+        return None, None
+    try:
+        sat = EarthSatellite(tle_line1, tle_line2, ts=_ts)
+        t   = _ts.from_datetime(t_utc.replace(tzinfo=datetime.timezone.utc))
+        sunlit = sat.at(t).is_sunlit(load('de421.bsp'))
+        return (not sunlit), (0.0 if sunlit else 1.0)
+    except Exception:
+        return None, None
+
+
+def skyfield_los_check(
+    tle_line1: str,
+    tle_line2: str,
+    t_utc: datetime.datetime,
+    lat_deg: float,
+    lon_deg: float,
+    min_elevation_deg: float = 5.0,
+) -> tuple[bool, float]:
+    """
+    Check ground-station line-of-sight using Skyfield's topocentric elevation.
+    More accurate than the dot-product method for stations at high latitudes.
+
+    Args:
+        tle_line1, tle_line2: TLE strings
+        t_utc:               UTC datetime
+        lat_deg, lon_deg:    Ground station geodetic coordinates
+        min_elevation_deg:   Minimum elevation angle for LOS
+
+    Returns:
+        (is_visible, elevation_deg)
+        Falls back to (None, None) if Skyfield is unavailable.
+    """
+    if not _SKYFIELD_AVAILABLE:
+        return None, None
+    try:
+        sat = EarthSatellite(tle_line1, tle_line2, ts=_ts)
+        t   = _ts.from_datetime(t_utc.replace(tzinfo=datetime.timezone.utc))
+        gs  = wgs84.latlon(lat_deg, lon_deg)
+        diff      = sat - gs
+        topocentric = diff.at(t)
+        alt, az, distance = topocentric.altaz()
+        elev = alt.degrees
+        return (elev >= min_elevation_deg), float(elev)
+    except Exception:
+        return None, None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Static Ground Stations (Lat, Lon) — Phase D

@@ -215,17 +215,17 @@ class EpisodicMemory:
                     ep.was_fault = False
                     migrated += 1
             if migrated:
-                print(f"[EpisodicMemory] ℹ Migrated {migrated} records "
+                print(f"[EpisodicMemory] [INFO] Migrated {migrated} records "
                       f"(added start_conditions={{}})")
 
             print(
-                f"[EpisodicMemory] ✓ Restored {len(self.episodes)} episodes "
+                f"[EpisodicMemory] [OK] Restored {len(self.episodes)} episodes "
                 f"({self.total_seen} total seen | "
                 f"Best: {self.best_reward:+.1f} | "
                 f"Worst: {self.worst_reward:+.1f})"
             )
         except Exception as exc:
-            print(f"[EpisodicMemory] ⚠ Could not load '{self.filepath}': {exc}. Starting fresh.")
+            print(f"[EpisodicMemory] [WARN] Could not load '{self.filepath}': {exc}. Starting fresh.")
 
     def query_similar_episode(self, current_orbital_state: dict, threshold=0.8):
         """

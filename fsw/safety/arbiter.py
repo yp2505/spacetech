@@ -238,6 +238,7 @@ class CommandArbiter:
             final_cmd.avoidance = 0.0
             # Apply safety shield even for EOL (rate limits still apply)
             shielded_cmd, approved, _ = self.safety_shield.filter(final_cmd, state)
+            shielded_cmd.approved = approved
             return shielded_cmd
 
         # ── SAFE MODE — classical controllers only, AI bypassed ──────────────
@@ -263,6 +264,7 @@ class CommandArbiter:
             final_cmd.reason_code = "SAFE_MODE_OVERRIDE"
             # Apply safety shield
             shielded_cmd, approved, _ = self.safety_shield.filter(final_cmd, state)
+            shielded_cmd.approved = approved
             return shielded_cmd
 
         # ── NOMINAL / DEGRADED — AI proposes, supervisor validates ───────────

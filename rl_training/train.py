@@ -28,6 +28,10 @@ Usage:
 
 import os
 import sys
+# Force UTF-8 encoding for standard output (fixes errors when logging to files on Windows)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 import copy
 import argparse
 from dataclasses import replace
@@ -54,8 +58,8 @@ from fsw.hal.isl_mesh import ISLMeshNetwork
 # ─────────────────────────────────────────────────────────────────────────────
 #  Hyper-parameters (can be overridden by CLI args)
 # ─────────────────────────────────────────────────────────────────────────────
-CYCLES          = 200       # Training cycles
-STEPS_PER_CYCLE = 5_000     # Steps per cycle per agent
+CYCLES          = 500       # Training cycles (500 * 20k = 10M per orbit. 30M Total)
+STEPS_PER_CYCLE = 20_000    # Steps per cycle per agent
 EWC_LAMBDA      = 5_000.0   # EWC regularization strength
 MODEL_PATH      = "ppo_swarm_brain.bin"
 EWC_PATH        = "ewc_fisher_swarm.pkl"
@@ -63,7 +67,8 @@ PHASE_B_ZIP     = "checkpoints/phase_b_archive/ppo_swarm_brain.bin"
 USE_MAPPO       = False     # Use MAPPO (shared critic)
 USE_IPPO        = False     # Use IPPO (independent critics)
 PARAM_SHARING   = True      # Parameter sharing across agents
-N_ENVS          = min(os.cpu_count() or 4, 8)  # Auto-detect CPU cores, cap at 8
+N_ENVS          = 4         # Reduced from 8 to 4 to maintain stable CPU temperature for multi-day runs
+
 
 # Detect device once at import time
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,28 +123,46 @@ class DetachedPolicyProxy:
         self.state_dict = {
             key: value.detach().cpu().clone() for key, value in policy.state_dict().items()
         }
+        self._cached_model = None
+        self._build_failed = False   # Step C: track silent failures
 
     def _rebuild(self):
-        model = self.policy_cls(
-            observation_space=self.observation_space,
-            action_space=self.action_space,
-            lr_schedule=self.lr_schedule,
-        )
-        model.load_state_dict(self.state_dict)
-        model.to("cpu")
-        model.eval()
-        return model
+        # Step C: wrap rebuild so worker processes raise a descriptive error
+        # instead of silently using a stale/None policy when obs space is not
+        # fully picklable (e.g. gym.spaces.Dict with non-primitive types).
+        try:
+            model = self.policy_cls(
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                lr_schedule=self.lr_schedule,
+            )
+            model.load_state_dict(self.state_dict)
+            model.to("cpu")
+            model.eval()
+            return model
+        except Exception as exc:
+            self._build_failed = True
+            raise RuntimeError(
+                f"[Step C] DetachedPolicyProxy._rebuild() failed in worker process. "
+                f"Self-play peer policy is unavailable this cycle. "
+                f"Root cause: {exc}"
+            ) from exc
 
     def predict(self, observation, deterministic=True, state=None, episode_start=None, **kwargs):
-        model = self._rebuild()
+        if getattr(self, "_cached_model", None) is None:
+            self._cached_model = self._rebuild()
         with torch.no_grad():
-            return model.predict(
+            return self._cached_model.predict(
                 observation,
                 deterministic=deterministic,
                 state=state,
                 episode_start=episode_start,
                 **kwargs,
             )
+
+    def is_valid(self) -> bool:
+        """Return False if _rebuild previously failed — lets callers skip self-play safely."""
+        return not self._build_failed
 
 
 def _constant_lr_schedule(_):
@@ -183,7 +206,7 @@ def build_or_load_model(env, continue_training: bool = False, train_env=None) ->
     model = PPO(
         CTDEPolicy, _env,
         verbose=0,
-        learning_rate=3e-4,
+        learning_rate=1e-6,
         n_steps=_n_steps,
         batch_size=_batch_size,
         n_epochs=10,
@@ -278,8 +301,8 @@ def main():
     global CYCLES, STEPS_PER_CYCLE, EWC_LAMBDA, USE_MAPPO, USE_IPPO, PARAM_SHARING, N_ENVS
     
     parser = argparse.ArgumentParser(description="Universal Satellite AI — Phases A-F Training")
-    parser.add_argument("--orbit",       type=str, default="starlink_leo",
-                        help="Satellite preset key (use --list-orbits to see options)")
+    parser.add_argument("--orbit",       type=str, default="universal",
+                        help="Satellite preset key, or 'universal' for the 3-day multi-orbit pipeline")
     parser.add_argument("--eval-only",   action="store_true",
                         help="Skip training, only run evaluation")
     parser.add_argument("--list-orbits", action="store_true",
@@ -297,17 +320,55 @@ def main():
     parser.add_argument("--continue-training", action="store_true",
                         help="Continue training from existing model with EWC protection")
     parser.add_argument("--n-envs", type=int, default=N_ENVS,
-                        help="Number of parallel environments for MAPPO/IPPO")
+                        help="Number of parallel environments")
     parser.add_argument("--ewc-lambda", type=float, default=5000.0,
                         help="EWC regularization strength")
     parser.add_argument("--cycles", type=int, default=200,
                         help="Number of training cycles")
-    parser.add_argument("--steps-per-cycle", type=int, default=5000,
+    parser.add_argument("--steps-per-cycle", type=int, default=STEPS_PER_CYCLE,
                         help="Steps per training cycle")
     parser.add_argument("--fast-eval", action="store_true",
                         help="Use 1-episode fast evaluation (avoids 15-min baseline block in Colab)")
     args = parser.parse_args()
 
+    # ── UNIVERSAL PIPELINE INTERCEPTOR ───────────────────────────────────────
+    if args.orbit == "universal":
+        import subprocess, sys, time
+        print("\n🌟 UNIVERSAL SWARM BRAIN - 3-DAY AUTOMATION PIPELINE 🌟")
+        print("Automatically cycling through LEO, MEO, and GEO orbits using EWC.\n")
+        
+        phases = [
+            ("starlink_leo", False),
+            ("gps_meo", True),
+            ("geo_comms", True)
+        ]
+        
+        for idx, (orb, cont) in enumerate(phases):
+            print(f"\n{'='*80}\n🚀 STARTING PHASE: {orb.upper()}\n{'='*80}\n")
+            cmd = [
+                sys.executable, "-m", "rl_training.train", 
+                "--orbit", orb, 
+                "--cycles", str(args.cycles), 
+                "--steps-per-cycle", str(args.steps_per_cycle)
+            ]
+            if cont:
+                cmd.append("--continue-training")
+            if args.fast_eval:
+                cmd.append("--fast-eval")
+            
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ ERROR: Phase {orb} failed! Exiting pipeline.")
+                sys.exit(e.returncode)
+                
+            if idx < len(phases) - 1:
+                print(f"\n✅ Phase {orb} completed. Cooling down CPU for 60 seconds...\n")
+                time.sleep(60)
+                
+        print("\n🎉 UNIVERSAL TRAINING COMPLETE! The AI has mastered all orbits.")
+        return
+    # ─────────────────────────────────────────────────────────────────────────
     if args.list_orbits:
         list_presets()
         return
@@ -441,7 +502,8 @@ def run_singleagent_training(config, memory, ewc, eval_only, continue_training, 
         print(f"  SubprocVecEnv: {N_ENVS} parallel workers on {os.cpu_count()} cores")
     else:
         train_env = DummyVecEnv([_make_worker_env(0)])
-        print("  DummyVecEnv: single-core mode")
+        print("  DummyVecEnv: single-env mode")
+
 
     model, is_new = build_or_load_model(env, continue_training, train_env=train_env)
     worker_policy = _detach_policy_for_worker(model.policy)

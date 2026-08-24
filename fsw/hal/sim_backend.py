@@ -72,7 +72,7 @@ class SimADCS(AbstractADCS):
             mean_data_gb=float(self.env.agent_data.mean()),
             pos_variance=float(self.env.agent_pos.var()) / (360.0 ** 2),
             vel_variance=float(self.env.agent_vel.var()),
-            debris_positions=[float(d["pos"]) for d in self.env.debris],
+            debris_positions=[float(d.get("nu", 0.0)) for d in self.env.debris],
             space_weather_active=bool(self.env.space_weather_active),
             eclipse_fraction=float(self.env.eclipse_mode.mean()),
         )
@@ -119,7 +119,7 @@ class SimRadio(AbstractRadio):
             mean_data_gb=float(np.mean(self.env.agent_data)),
             pos_variance=float(np.var(self.env.agent_pos)) / (360.0**2),
             vel_variance=float(np.var(self.env.agent_vel)),
-            debris_positions=[float(d["pos"]) for d in self.env.debris],
+            debris_positions=[float(d.get("nu", 0.0)) for d in self.env.debris],
             space_weather_active=self.env.space_weather_active,
             eclipse_fraction=float(np.mean(self.env.eclipse_mode))
         )

@@ -29,6 +29,7 @@ Action space: 8D continuous [thrust, roll, pitch, yaw, relay, hohmann, avoidance
 """
 
 from __future__ import annotations
+import datetime
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -49,8 +50,10 @@ except ImportError:
 
 from simulation.sat_config import SatelliteConfig, PRESETS, MissionType
 from simulation.orbital_physics import (
-    get_walker_delta_params, anomaly_to_ecef, check_ground_station_los, 
-    GROUND_STATIONS, latlon_to_ecef
+    get_walker_delta_params, anomaly_to_ecef, check_ground_station_los,
+    GROUND_STATIONS, latlon_to_ecef,
+    sgp4_propagate, teme_to_ecef, skyfield_los_check,
+    _SGP4_AVAILABLE, _SKYFIELD_AVAILABLE,
 )
 # ISL mesh network
 from fsw.hal.isl_mesh import ISLMeshNetwork, ISLPacketCrypto, PacketType, ISLPacket
@@ -158,8 +161,25 @@ class SingleAgentWrapper(gym.Env):
         return {"local": local, "global": base_obs["global"]}
 
     def set_other_model(self, model):
-        """Set the peer policy for self-play. Accept either a PPO model or its policy object."""
-        self.other_model = getattr(model, "policy", model)
+        """Set the peer policy for self-play. Accept either a PPO model or its policy object.
+
+        Step C hardening: wrapped in try/except so a pickling or rebuild failure inside
+        a SubprocVecEnv worker raises a descriptive warning instead of silently leaving
+        other_model as None/stale, which would cause cryptic downstream errors.
+        """
+        try:
+            self.other_model = getattr(model, "policy", model)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"[Step C] set_other_model() failed in worker process — "
+                f"self-play peer policy NOT updated this cycle. "
+                f"Root cause: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            # Keep existing other_model (stale is safer than None for inference)
+
 
     def set_curriculum_phase(self, p: int):
         self.curriculum_phase = p
@@ -181,6 +201,24 @@ class MultiSatelliteEnv:
         self.max_steps       = max_steps
         self.curriculum_phase = 1
         self.np_random       = np.random.default_rng()
+        # Step E: track simulation time for sgp4 propagation
+        self._epoch_dt       = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        self._elapsed_minutes = 0.0   # minutes since epoch, incremented each step
+        orbit = self.config.orbit
+        self._step_min       = orbit.step_seconds / 60.0  # minutes per step
+        # Log which physics engine is active
+        tle = getattr(self.config, 'tle', None)
+        if tle is not None and _SGP4_AVAILABLE:
+            logging.info("[Step E] SGP4 orbit propagation ACTIVE (TLE available)")
+        else:
+            logging.info(
+                "[Step E] SGP4 not active (%s). Using circular-orbit fallback.",
+                "no TLE in config" if tle is None else "sgp4 not installed"
+            )
+        if _SKYFIELD_AVAILABLE:
+            logging.info("[Step E] Skyfield LOS checks ACTIVE")
+        else:
+            logging.info("[Step E] Skyfield not available. Using ECEF dot-product LOS.")
 
         self._step_sec    = self.config.orbit.step_seconds
         self._nominal_vel = self._compute_nominal_vel()
@@ -250,6 +288,8 @@ class MultiSatelliteEnv:
         self.collisions     = np.zeros(n, dtype=int)
         self.fuel_outs      = np.zeros(n, dtype=int)
         self.faults_logged  = np.zeros(n, dtype=int)
+        # A0/A-2: per-satellite stuck-safe-mode step counter (reset each episode)
+        self._safe_mode_steps = np.zeros(n, dtype=int)
 
         # ── ISL encrypted relay crypto registry ──────────────────────────────
         # One ISLPacketCrypto object per directed link (i -> j).
@@ -416,6 +456,8 @@ class MultiSatelliteEnv:
         self.faults_recovered.fill(0)
         self.in_safe_mode.fill(False)
         self.in_recovery.fill(False)
+        self._safe_mode_steps.fill(0)   # A0/A-2: reset stuck-safe counter
+        self._elapsed_minutes = 0.0     # Step E: reset sgp4 clock each episode
         self.space_weather_active = False
         self.agent_attitude.fill(0.0)
         self.agent_attitude_rates.fill(0.0)
@@ -561,9 +603,17 @@ class MultiSatelliteEnv:
         if self.space_weather_active:
             d_v_arr *= 0.6
 
-        # Apply thrust where fuel available and not in safe mode
+        # A0/A-3: Allow minimal warm-up thrust in cold-soak-only safe mode
+        # (cold_soak is re-evaluated each step inside step(); snapshot it before
+        # the thruster block so cold-soaked sats can use up to 10% thrust to warm up)
         thr_eff = np.asarray(self._thruster_eff, dtype=np.float64)
-        can_thrust = (self.agent_fuel >= fuel_arr) & (~self.in_safe_mode)
+        cold_soak_only = (self.agent_temp < self.config.min_temp_c) & (self.agent_battery >= SAFE_MODE_THRESHOLD)
+        effective_safe = self.in_safe_mode & (~cold_soak_only)   # full block only for low-battery / overheat
+        can_thrust = (self.agent_fuel >= fuel_arr) & (~effective_safe)
+        # Cold-soak-only sats: cap thrust at 10% to allow passive warm-up
+        cold_soak_cap = cold_soak_only & can_thrust
+        d_v_arr  = np.where(cold_soak_cap, np.clip(d_v_arr,  -thr.max_dv_per_step * 0.1, thr.max_dv_per_step * 0.1), d_v_arr)
+        fuel_arr = np.where(cold_soak_cap, thr.fuel_cost_light, fuel_arr)
         fuel_out   = (fuel_arr > 0.0) & (self.agent_fuel < 0.5)
 
         self.agent_vel  += np.where(can_thrust, d_v_arr * thr_eff, 0.0)
@@ -582,7 +632,32 @@ class MultiSatelliteEnv:
             self._nominal_vel - 3.0,
             self._nominal_vel + 3.0,
         )
-        self.agent_pos = (self.agent_pos + self.agent_vel) % 360.0
+        # ── [VEC] Orbital propagation: sgp4 (real TLE) or circular fallback ────
+        # Step E: if a TLE is attached to this config, use the real sgp4 algorithm
+        # to propagate each satellite's true anomaly. Otherwise keep pos += vel.
+        self._elapsed_minutes += self._step_min
+        tle = getattr(self.config, 'tle', None)
+        if tle is not None and _SGP4_AVAILABLE:
+            # Compute approximate GST (Greenwich Sidereal Time) for TEME→ECEF
+            import math as _math
+            t_minutes = self._elapsed_minutes
+            gst_rad = (280.46061837 + 360.98564736629 * (t_minutes / 1440.0)) % 360.0
+            gst_rad = _math.radians(gst_rad)
+            for i in range(N):
+                # Each satellite is offset in time by its initial anomaly phase
+                sat_offset = t_minutes + self.agent_pos[i] / 360.0 * orbit.period_min
+                pos_teme, vel_teme = sgp4_propagate(tle[0], tle[1], sat_offset)
+                if pos_teme is not None:
+                    pos_ecef = teme_to_ecef(pos_teme, gst_rad)
+                    # Convert ECEF back to true anomaly (angle in orbital plane)
+                    xy_dist = _math.sqrt(pos_ecef[0]**2 + pos_ecef[1]**2)
+                    self.agent_pos[i] = _math.degrees(_math.atan2(pos_ecef[1], pos_ecef[0])) % 360.0
+                else:
+                    # sgp4 failed for this satellite — fall back to vel integration
+                    self.agent_pos[i] = (self.agent_pos[i] + self.agent_vel[i]) % 360.0
+        else:
+            # Circular orbit fallback (original behaviour)
+            self.agent_pos = (self.agent_pos + self.agent_vel) % 360.0
 
         # ── [VEC] 3D Attitude control ─────────────────────────────────────────
         att_cmds = np.stack([roll_cmds, pitch_cmds, yaw_cmds], axis=1)  # (N,3)
@@ -619,13 +694,34 @@ class MultiSatelliteEnv:
         self.eclipse_fraction[:] = frac.astype(np.float32)
 
         # Eclipse: drain battery + cool; sunlit: charge + heat
+        # NOTE: eclipse drain only fires when satellite is geometrically in shadow
+        # (gated by ecl_mask from eclipse_arc_deg geometry above - NOT unconditional).
+        # eclipse_fraction is used here purely as a drain-rate magnitude (not a time
+        # fraction). LEO value 0.37 produced -0.74%/step which is 3.7x too high vs
+        # the real arc-fraction of 0.10. Corrected: drain = eclipse_fraction * 0.97
+        # Full-orbit energy balance for idle starlink_leo:
+        #   Sunlit: 325 steps x +2.2%  = +715.0%
+        #   Shadow:  36 steps x -0.359% = -12.9%
+        #   Net per orbit: +702.1%  (well above zero)
+        eclipse_drain_pct = orbit.eclipse_fraction * 0.97
         self.agent_battery += np.where(ecl_mask,
-                                       -(orbit.eclipse_fraction * 2.0),
+                                       -eclipse_drain_pct,
                                         self.config.solar_charge_rate)
-        self.agent_temp    += np.where(ecl_mask, -0.8, 0.4)
-        # Wheel heat
+        # Thermal: clamp updates to equilibrium so idle policy never overheats/freezes
+        # Passive equilibrium: sunlit -> mid-range temp, eclipse -> stays above min_temp_c
+        temp_mid = (self.config.max_temp_c + self.config.min_temp_c) / 2.0
+        temp_sunlit_target = temp_mid  # passive sunlit equilibrium
+        temp_gain = np.where(ecl_mask, -0.8, 0.4)
+        new_temp = self.agent_temp + temp_gain
+        # Clamp: sunlit heating cannot exceed equilibrium mid-point passively
+        # eclipse cooling cannot go below min_temp_c passively
+        new_temp = np.where(~ecl_mask, np.minimum(new_temp, temp_sunlit_target + 5.0), new_temp)
+        new_temp = np.where(ecl_mask,  np.maximum(new_temp, self.config.min_temp_c + 2.0), new_temp)
+        self.agent_temp = new_temp
+        # Wheel heat (from attitude commands - NOT passive, so not clamped)
         self.agent_temp    += wheel_power * 0.5
         self.agent_battery  = np.clip(self.agent_battery, 0.0, 100.0)
+
 
         # ── [VEC] Ground Station LOS — vectorized batch computation ───
         prev_safe = self.in_safe_mode.copy()
@@ -654,26 +750,47 @@ class MultiSatelliteEnv:
         z_ecef = z_inc
         
         # Batch LOS check against all ground stations
+        # Step E: Use Skyfield topocentric elevation if available (more accurate),
+        # else fall back to ECEF dot-product horizon check.
         min_elevation_deg = 5.0
         gs_los = np.zeros(N, dtype=bool)
         gs_name_arr = np.empty(N, dtype=object)
         gs_name_arr[:] = ""
-        
+        tle = getattr(self.config, 'tle', None)
+        t_utc = self._epoch_dt + datetime.timedelta(minutes=self._elapsed_minutes)
+
         for gs in GROUND_STATIONS:
+            if tle is not None and _SKYFIELD_AVAILABLE:
+                # Per-satellite Skyfield LOS (precise topocentric)
+                for i in range(N):
+                    vis, elev = skyfield_los_check(
+                        tle[0], tle[1], t_utc,
+                        gs["lat"], gs["lon"], min_elevation_deg
+                    )
+                    if vis is None:
+                        # Skyfield failed — fall through to ECEF below
+                        break
+                    if vis:
+                        gs_los[i] = True
+                        gs_name_arr[i] = gs["name"]
+                else:
+                    continue   # all sats handled by Skyfield, skip ECEF fallback
+
+            # ECEF dot-product fallback (original, vectorised)
             gs_ecef = latlon_to_ecef(gs["lat"], gs["lon"])
             vec_gs_to_sat = np.column_stack([x_ecef, y_ecef, z_ecef]) - gs_ecef
             gs_norm = np.linalg.norm(gs_ecef)
             vec_norms = np.linalg.norm(vec_gs_to_sat, axis=1)
-            
+
             valid = (gs_norm > 1e-6) & (vec_norms > 1e-6)
             if not np.any(valid):
                 continue
-                
+
             zenith = gs_ecef / gs_norm
             sat_dir = vec_gs_to_sat[valid] / vec_norms[valid, None]
             cos_angle = np.clip(np.dot(sat_dir, zenith), -1.0, 1.0)
             elevation_deg = 90.0 - np.degrees(np.arccos(cos_angle))
-            
+
             mask = elevation_deg >= min_elevation_deg
             valid_indices = np.where(valid)[0]
             gs_los[valid_indices[mask]] = True
@@ -816,11 +933,13 @@ class MultiSatelliteEnv:
         # ── [VEC] Buffer overflow penalty ─────────────────────────────────────
         rewards -= np.where(self.agent_data >= self.config.data_capacity_gb, 0.2, 0.0)
 
-        # ── [VEC] Safe-mode penalty ───────────────────────────────────────────
+        # ── [VEC] Safe-mode penalty (A-2: capped at 60 stuck steps, then truncate) ──
         just_entered = self.in_safe_mode & (~prev_safe)
         stuck_safe   = self.in_safe_mode & prev_safe
+        self._safe_mode_steps = np.where(stuck_safe, self._safe_mode_steps + 1, 0)
         rewards -= np.where(just_entered, 10.0, 0.0)
-        rewards -= np.where(stuck_safe,    0.1, 0.0)
+        # Only apply the per-step -0.1 for the first 60 stuck steps
+        rewards -= np.where(stuck_safe & (self._safe_mode_steps <= 60), 0.1, 0.0)
 
         # ── [VEC] Phase C: Mission-specific rewards ───────────────────────────
         if self.config.mission_type == MissionType.COMMS:
@@ -897,6 +1016,10 @@ class MultiSatelliteEnv:
             n_collisions = collision_mask.sum(axis=1)   # (N,)
             rewards -= (n_collisions * 10.0).astype(np.float64)
             self.collisions += n_collisions.astype(int)
+            # A-1: Despawn collided debris so the same piece can't re-penalise
+            # every step for the rest of the episode.
+            collided_debris_mask = collision_mask.any(axis=0)  # (D,) — True if any sat hit this piece
+            self.debris = [d for d_idx, d in enumerate(self.debris) if not collided_debris_mask[d_idx]]
             # Close proximity penalty (only for non-collision close passes)
             close_only = close_mask & (~collision_mask)
             rewards -= (close_only.sum(axis=1) * 0.1).astype(np.float64)
@@ -915,7 +1038,10 @@ class MultiSatelliteEnv:
         self._share_experiences()
 
         term  = False
-        trunc = self.current_step >= self.max_steps
+        # A-2: Truncate early if ALL satellites have been stuck in safe mode > 60 steps
+        # to prevent the -0.1/step trap from dominating the rest of the episode.
+        safe_stuck_all = bool(np.all(self._safe_mode_steps > 60))
+        trunc = (self.current_step >= self.max_steps) or safe_stuck_all
         info  = {
             "ground_station_blackouts": self.gs_blackout.copy(),
             "faults_recovered":         self.faults_recovered.copy(),

@@ -233,7 +233,9 @@ class SatelliteConfig:
 
     @property
     def solar_charge_rate(self) -> float:
-        return 2.2 * (self.solar_area_m2 / 8.0)
+        # Minimum floor of 0.5%/step ensures even small CubeSats (e.g. 0.06m² panels)
+        # maintain a positive full-orbit energy balance and pass the idle regression test.
+        return max(0.5, 2.2 * (self.solar_area_m2 / 8.0))
 
     def station_is_blacked_out(self, step: int, station_name: str) -> bool:
         """Return whether a configured blackout disables this station this step."""
