@@ -6,6 +6,10 @@ Runs the new Onboard Autonomy Agent flight software against the simulated
 MultiSatelliteEnv physics backend, demonstrating the AI sandbox and FDIR.
 """
 
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from fsw.main import OnboardAutonomyAgent
 from fsw.hal.sim_backend import SimEPS, SimThermal, SimADCS, SimRadio, SimFaultMonitor
 from simulation.satellite_env import MultiSatelliteEnv
@@ -57,7 +61,7 @@ def run_sil_test():
         
         # Step the actual physics environment
         # We pass zero-actions for all other satellites for this single-agent test
-        actions = [[0.0, 0.0, 0.0, 0.0] for _ in range(config.num_satellites)]
+        actions = [[0.0] * 8 for _ in range(config.num_satellites)]
         actions[agent_idx] = cmd
         sim_env.step(actions)
         
