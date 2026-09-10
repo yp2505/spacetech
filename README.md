@@ -14,7 +14,10 @@ An end-to-end, high-fidelity autonomous satellite swarm management platform and 
 ## Table of Contents
 1. [Key Features & System Highlights](#key-features--system-highlights)
 2. [Phased Development Roadmap (Phases A–F)](#phased-development-roadmap-phases-af)
-3. [System Architecture](#system-architecture)
+3. [System & Web Architecture](#system--web-architecture)
+    - [End-to-End System & Web Platform Flowchart](#1-end-to-end-system--web-platform-flowchart)
+    - [Real-Time Telemetry & Control Loop Sequence](#2-real-time-telemetry--control-loop-sequence)
+    - [Layer-by-Layer Architectural Breakdown](#3-layer-by-layer-architectural-breakdown)
 4. [Flight Software (FSW) — ARTEMIS Executive](#flight-software-fsw--artemis-executive)
 5. [Reinforcement Learning & Universal Swarm Brain](#reinforcement-learning--universal-swarm-brain)
 6. [Orbital Physics & Dynamics Engine](#orbital-physics--dynamics-engine)
@@ -69,58 +72,155 @@ An end-to-end, high-fidelity autonomous satellite swarm management platform and 
 
 ---
 
-## System Architecture
+---
 
+## System & Web Architecture
+
+SpaceTech features a modular, cloud- and web-ready multi-tier architecture designed for real-time telemetry streaming, interactive 3D web visualization, and flight-proven embedded autonomy.
+
+### 1. End-to-End System & Web Platform Flowchart
+
+```mermaid
+flowchart TD
+    %% Styling Classes
+    classDef webLayer fill:#0B132B,stroke:#00D4FF,stroke-width:2px,color:#FFFFFF
+    classDef fswLayer fill:#1C2541,stroke:#6BCB77,stroke-width:2px,color:#FFFFFF
+    classDef aiLayer fill:#3A0CA3,stroke:#C77DFF,stroke-width:2px,color:#FFFFFF
+    classDef islLayer fill:#0B3C49,stroke:#FFD93D,stroke-width:2px,color:#FFFFFF
+    classDef simLayer fill:#1F1D36,stroke:#FF6B6B,stroke-width:2px,color:#FFFFFF
+    classDef safety fill:#5C0614,stroke:#FF4444,stroke-width:3px,color:#FFFFFF
+
+    subgraph WEB ["🌐 Layer 1: Web UI & Ground Operations Segment"]
+        WEB_CLIENT["CesiumJS 3D Web Viewer<br/>(cesium_viewer.html)"]:::webLayer
+        HUD["Glassmorphism HUD &<br/>Live Telemetry Overlay"]:::webLayer
+        CZML_GEN["CZML Time-Series Engine<br/>(outputs/constellation.czml)"]:::webLayer
+        GROUND_STATIONS["Global Ground Stations<br/>(Svalbard, Punta Arenas, Hawaii, etc.)"]:::webLayer
+    end
+
+    subgraph FSW ["🛡️ Layer 2: ARTEMIS Embedded Flight Software (FSW)"]
+        SCHEDULER["Cyclic Executive Scheduler<br/>(10 Hz Deterministic Loop)"]:::fswLayer
+        FDIR["FDIR State Machine<br/>(BOOT / NOMINAL / DEGRADED / SAFE)"]:::fswLayer
+        WATCHDOG["Multi-Tier Watchdog<br/>(Heartbeats & Auto-Safe Trigger)"]:::fswLayer
+        ARBITER["Safety Supervisor & Arbiter<br/>(Priority: Safety > Health > Mission)"]:::safety
+    end
+
+    subgraph AI ["🧠 Layer 3: Universal Swarm AI Brain (RL & Continual Learning)"]
+        OBS_VAL["Observation Adapter & Validator<br/>(48-dim Local / 63-dim Global)"]:::aiLayer
+        AI_BRAIN["Universal Swarm Brain<br/>(Actor-Critic PPO Policy)"]:::aiLayer
+        EWC["Elastic Weight Consolidation (EWC)<br/>(Fisher Regularization λ=5000)"]:::aiLayer
+    end
+
+    subgraph ISL ["📡 Layer 4: Inter-Satellite Link (ISL) Mesh & Memory Gossip"]
+        ISL_MESH["ISL Mesh Router<br/>(fsw/hal/isl_mesh.py)"]:::islLayer
+        CRYPTO["Rolling-XOR + SHA-256<br/>Packet Authentication"]:::islLayer
+        GOSSIP["Distributed Episodic Memory Gossip<br/>(Salience Replay Sharing)"]:::islLayer
+    end
+
+    subgraph SIM ["🚀 Layer 5: High-Fidelity Orbital Physics & Simulation Backend"]
+        ORBIT_DYN["Orbital Mechanics & J2 Precession<br/>(simulation/orbital_physics.py)"]:::simLayer
+        ADCS_DYN["3D Attitude Dynamics & Wheels<br/>(Quaternions & Reaction Wheels)"]:::simLayer
+        THERMAL_EPS["Radiative Thermal & EPS Model<br/>(Photovoltaics + Eclipse Drain)"]:::simLayer
+        DEBRIS_ENV["Debris & Space Weather Engine<br/>(Collision Cones & Radiation)"]:::simLayer
+    end
+
+    %% Web Dataflow
+    CZML_GEN <-->|CZML Time-Series Stream| WEB_CLIENT
+    HUD <-->|DOM Real-Time Telemetry| WEB_CLIENT
+    GROUND_STATIONS <-->|LOS Uplink & Downlink Tracking| SCHEDULER
+    ORBIT_DYN -->|Epoch Orbit Points & ISL Vectors| CZML_GEN
+
+    %% FSW Dataflow
+    SCHEDULER -->|10 Hz Task Executive| FDIR
+    FDIR -->|Subsystem Health Heartbeat| WATCHDOG
+    FDIR -->|Validated Sensor Telemetry| OBS_VAL
+    OBS_VAL -->|Normalized 48-dim Obs| AI_BRAIN
+    EWC -.->|Fisher Regularization Matrix| AI_BRAIN
+
+    %% Safety & Actuation
+    AI_BRAIN -->|Proposed 8D Actions| ARBITER
+    ARBITER -->|Approved Thrust & Burns| ORBIT_DYN
+    ARBITER -->|Approved Attitude Torques| ADCS_DYN
+    ARBITER -.->|Veto / Safe Mode Fallback| FDIR
+
+    %% ISL Mesh & Gossip
+    AI_BRAIN <-->|Crosslink Comms| ISL_MESH
+    ISL_MESH <-->|Encrypted Wire Packets| CRYPTO
+    ISL_MESH <-->|P2P Experience Exchange| GOSSIP
+
+    %% Simulation Interconnections
+    ORBIT_DYN <-->|Kinematic Coupling| ADCS_DYN
+    ORBIT_DYN <-->|Solar Flux & Eclipse Geometry| THERMAL_EPS
+    ORBIT_DYN <-->|Relative Range Vectors| DEBRIS_ENV
+    THERMAL_EPS -->|Thermal & Battery State| FDIR
+    DEBRIS_ENV -->|Proximity Flags| OBS_VAL
 ```
-                                  +-------------------------------------------------------+
-                                  |                 GROUND SEGMENT / C2                   |
-                                  |   - Global Stations (Svalbard, Punta Arenas, etc.)    |
-                                  |   - TLE Ingestion & Blackout Scheduling               |
-                                  +---------------------------+---------------------------+
-                                                              |  Uplink / Downlink (LOS)
-                                                              v
-+-------------------------------------------------------------------------------------------------------------------------+
-|                                        ARTEMIS ONBOARD FLIGHT SOFTWARE (FSW)                                            |
-|                                                                                                                         |
-|   +-----------------------+     +------------------------+     +-----------------------+     +----------------------+   |
-|   |   Cyclic Scheduler    | --> |    Telemetry Monitor   | --> |       FDIR FSM        | --> |   Watchdog Manager   |   |
-|   |     (10 Hz Executive) |     | (Sensors, EPS, Thermal)|     | (Nominal/Degraded/Safe|     | (Heartbeat / Safety) |   |
-|   +-----------------------+     +------------------------+     +-----------------------+     +----------------------+   |
-|                                                                                                                         |
-|   +-----------------------------------------------------------------------------------------------------------------+   |
-|   |                                         SAFETY SUPERVISOR & ARBITER                                             |   |
-|   |         Deterministic Rule Hierarchy: Safety > Health > Mission > Constellation > Longevity                    |   |
-|   |         - Approves AI commands when safe                                                                        |   |
-|   |         - Fallbacks to deterministic safe-hold / classical controller on constraint breach                      |   |
-|   +-------------------------------------------------------+---------------------------------------------------------+   |
-|                                                           ^
-|                                                           | Action Proposal (8-dim continuous)
-|                                                           |
-|   +-------------------------------------------------------+---------------------------------------------------------+   |
-|   |                                       UNIVERSAL SWARM AI BRAIN                                                  |   |
-|   |   - PPO / MAPPO Policy Network (Actor-Critic)                                                                   |   |
-|   |   - Local Observation: 48-dim (Physical, Attitude, ISL, Config, Recovery, Memory Context)                       |   |
-|   |   - Global Observation: 63-dim (Centralized Critic for CTDE)                                                    |   |
-|   |   - Continual Learning: Elastic Weight Consolidation (EWC) (Fisher matrix lambda=5000)                          |   |
-|   +-------------------------------------------------------+---------------------------------------------------------+   |
-|                                                           ^
-|                                                           | Experience Sharing & Gossip
-|                                                           v
-|   +-----------------------------------------------------------------------------------------------------------------+   |
-|   |                          ISL MESH NETWORK & DISTRIBUTED EPISODIC MEMORY GOSSIP                                  |   |
-|   |   - Rolling-XOR + SHA-256 encrypted peer-to-peer inter-satellite packets                                            |   |
-|   |   - Salience-ranked episode replay buffer sharing across fleet members                                          |   |
-|   +-----------------------------------------------------------------------------------------------------------------+   |
-|                                                           | Actuator Commands
-v                                                           v
-+-------------------------------------------------------------------------------------------------------------------------+
-|                                          HIGH-FIDELITY SIMULATION BACKEND                                               |
-|   - Multi-satellite orbital physics (Keplerian + J2 perturbation + atmospheric drag + solar radiation pressure)         |
-|   - 3D Attitude dynamics (quaternion propagation, reaction wheels, thruster torques)                                   |
-|   - Thermal radiative equilibrium & battery power model (photovoltaic charging + eclipse drain)                        |
-|   - Dynamic orbital debris tracking & space weather radiation events                                                   |
-+-------------------------------------------------------------------------------------------------------------------------+
+
+---
+
+### 2. Real-Time Telemetry & Control Loop Sequence
+
+This sequence diagram illustrates the deterministic 10 Hz real-time interaction between the Web Client, Flight Software, AI Brain, and Simulation Engine:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Web User / Flight Controller
+    participant Web as CesiumJS 3D Web UI (HUD)
+    participant FSW as ARTEMIS Executive (Scheduler & FDIR)
+    participant Arbiter as Safety Supervisor & Arbiter
+    participant Brain as Universal Swarm Brain (PPO Policy)
+    participant Mesh as ISL Mesh & Memory Gossip
+    participant Sim as Orbital Dynamics Simulation
+
+    User->>Web: Launch Web Viewer & Connect Telemetry
+    Web->>FSW: Ingest TLE Orbits & Outage Schedules
+    loop 10 Hz Real-Time Execution Loop
+        Sim->>FSW: Hardware Telemetry (EPS SoC, ADCS, Thermal, LOS)
+        FSW->>FSW: Evaluate FDIR Monitors (Nominal / Degraded / Safe)
+        FSW->>Brain: Assemble 48-dim Observation Vector
+        Brain->>Arbiter: Propose 8-dim Continuous Action
+        alt Envelope Safe (Battery >= 12%, Temp in Range, No Fault)
+            Arbiter->>Sim: Dispatch AI Actuator Commands
+        else Safety Violation Detected
+            Arbiter->>Sim: Intervene with Classical Safe-Hold Control
+        end
+        Brain->>Mesh: Broadcast Encrypted ISL Packet & Salient Memory
+        Mesh-->>Brain: Receive Neighbor Crosslink Gossip
+        Sim->>Web: Stream CZML Orbital Epochs & Satellite State
+        Web->>User: Render 3D Earth, ISL Links & HUD Telemetry
+    end
 ```
+
+---
+
+### 3. Layer-by-Layer Architectural Breakdown
+
+#### 🌐 Layer 1: Web Visualization & Ground Operations Segment
+- **CesiumJS 3D Web Engine (`cesium_viewer.html`)**: WebGL-powered dynamic Earth globe rendering true-to-scale satellite orbits, ground tracks, attitude orientations, and inter-satellite crosslinks.
+- **Glassmorphism Mission HUD**: Real-time Heads-Up Display showing per-satellite state of health (SoH), battery state-of-charge (SoC), thermal temperatures, active FDIR mode, and downlink speeds.
+- **CZML Time-Series Streaming (`outputs/constellation.czml`)**: High-throughput JSON schema for streaming sampled positions, velocity vectors, and entity orientations directly into the web client.
+- **Ground Station Tracking Network**: Mathematical line-of-sight tracking for 5 global ground stations with configurable elevation masks and blackout schedules.
+
+#### 🛡️ Layer 2: ARTEMIS Embedded Flight Software (FSW)
+- **Deterministic Cyclic Scheduler (`fsw/core/scheduler.py`)**: 10 Hz cyclic executive managing time-sliced execution across telemetry (10 Hz), FDIR (5 Hz), and AI inference (2 Hz).
+- **Subsystem Telemetry Monitors (`fsw/fdir/monitors.py`)**: Continuously monitors bus voltages, thermal sensor ranges, and actuator health.
+- **Fault Detection, Isolation, and Recovery (FDIR) (`fsw/fdir/state_machine.py`)**: Manages the operational states (`BOOT`, `NOMINAL`, `DEGRADED`, `RECOVERY`, `SAFE_MODE`).
+- **Safety Supervisor & Command Arbiter (`fsw/safety/arbiter.py`)**: Hardware-level safety interlock implementing rule-based prioritization (**Safety > Health > Mission > Constellation > Longevity**).
+
+#### 🧠 Layer 3: Universal Swarm AI Brain (Reinforcement Learning)
+- **Unified Neural Policy**: Actor-Critic PPO/MAPPO network capable of controlling heterogeneous satellites across LEO, MEO, and GEO.
+- **Observation Space**: 48-dim local observation and 63-dim centralized critic observation.
+- **Continual Learning (EWC)**: Protects 565,329 neural weights ($\lambda=5000$) against catastrophic forgetting during multi-orbit migrations.
+
+#### 📡 Layer 4: Inter-Satellite Link (ISL) Mesh & Memory Gossip
+- **Dynamic Mesh Routing (`fsw/hal/isl_mesh.py`)**: Constellation-wide packet forwarding with automatic topology reconfiguration.
+- **Cryptographic Wire Protocol**: Every packet is signed and verified using rolling-XOR obfuscation and SHA-256 HMAC key derivation.
+- **Distributed Episodic Memory Gossip**: Peer-to-peer asynchronous gossip sharing high-salience experiences (anomalies, rare recovery maneuvers, optimal formation corrections).
+
+#### 🚀 Layer 5: High-Fidelity Orbital Physics & Simulation Backend
+- **Perturbed Orbit Dynamics (`simulation/orbital_physics.py`)**: J2 oblateness harmonics, atmospheric drag modeling, solar radiation pressure, and optional SGP4/Skyfield celestial propagation.
+- **Attitude Dynamics**: Quaternion-based kinematics with 3-axis reaction wheel inertia coupling and thruster plume torques.
+- **Radiative Thermal & EPS Balance**: Stefan-Boltzmann equilibrium balancing direct solar irradiance, Earth albedo, thermal emissions, and battery charge/discharge cycles.
 
 ---
 
