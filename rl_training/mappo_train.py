@@ -47,9 +47,15 @@ from gymnasium import spaces
 CYCLES = 200
 STEPS_PER_CYCLE = 5_000
 EWC_LAMBDA = 5_000.0
-MODEL_PATH = "ppo_swarm_brain.bin"
+# SB3 saves as .zip — .bin was wrong and caused weights to never load
+MODEL_PATH = "ppo_swarm_brain.zip"
 EWC_PATH = "ewc_fisher_swarm.pkl"
+# Phase B archive: .bin is the correct extension here (it IS a zip internally)
 PHASE_B_ZIP = "checkpoints/phase_b_archive/ppo_swarm_brain.bin"
+
+# When loading existing weights, start curriculum at this phase instead of 1
+# Prevents reward collapse when a trained agent is forced back to baby-level tasks
+WARM_START_PHASE = 4   # skips phases 1-3, starts at medium difficulty
 
 # MAPPO specific
 USE_MAPPO = True          # True=MAPPO (shared critic), False=IPPO (independent critics)
@@ -60,13 +66,27 @@ N_ENVS = min(os.cpu_count() or 4, 8)  # Auto-detect CPU cores, cap at 8
 # ─────────────────────────────────────────────────────────────────────────────
 #  Curriculum
 # ─────────────────────────────────────────────────────────────────────────────
-def curriculum_phase(cycle: int) -> int:
-    if cycle <= 10:  return 1
-    if cycle <= 30:  return 2
-    if cycle <= 60:  return 3
-    if cycle <= 90:  return 4
-    if cycle <= 130: return 5
-    return 6
+def curriculum_phase(cycle: int, warm_start: bool = False) -> int:
+    """Return curriculum difficulty phase for a given cycle.
+
+    When warm_start=True (loading pre-trained weights), we skip the easy
+    early phases that caused reward collapse in the original training.
+    The agent already knows the basics — starting at phase 1 confuses it.
+    """
+    if warm_start:
+        # Compressed schedule: reach max difficulty faster
+        if cycle <= 5:   return WARM_START_PHASE
+        if cycle <= 20:  return min(WARM_START_PHASE + 1, 5)
+        if cycle <= 50:  return 5
+        return 6
+    else:
+        # Normal schedule from scratch
+        if cycle <= 10:  return 1
+        if cycle <= 30:  return 2
+        if cycle <= 60:  return 3
+        if cycle <= 90:  return 4
+        if cycle <= 130: return 5
+        return 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,30 +370,38 @@ def _enforce_rollout_length(num_envs: int, env_max_steps: int = 360) -> int:
         n_steps = max(10, STEPS_PER_CYCLE // max(1, int(num_envs)))
     return n_steps
 
-def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteConfig) -> List[PPO]:
-    """Build or load models for each agent (or shared model with parameter sharing)."""
+def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteConfig) -> Tuple[List[PPO], bool]:
+    """Build or load models for each agent (or shared model with parameter sharing).
+    
+    Returns:
+        (models, warm_start) — warm_start=True means we loaded pre-trained weights.
+        The caller uses warm_start to pick the right curriculum schedule.
+    """
     _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
     models = []
-    
+    warm_start = False
+
+    # ── Helper: try both .zip and .bin extensions ─────────────────────────────
+    def _find_model(path: str) -> Optional[str]:
+        """Return the actual model path (tries .zip then .bin then as-is)."""
+        for candidate in [path, path.replace('.zip', '.bin'), path.replace('.bin', '.zip')]:
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
     if PARAMETER_SHARING:
         # Single shared model for all agents
-        if os.path.exists(MODEL_PATH):
-            print(f"  ✓ Loading shared MAPPO model from {MODEL_PATH}")
+        found_path = _find_model(MODEL_PATH)
+        if found_path:
+            print(f"  ✓ Loading shared MAPPO model from {found_path}")
             from rl_training.ctde_policy import CTDEPolicy
-            model = PPO.load(MODEL_PATH, env=env_wrapper.vec_env, custom_objects={'policy_class': MAPPOPolicy})
-            # Replicate for each agent (same model reference)
+            model = PPO.load(found_path, env=env_wrapper.vec_env,
+                             custom_objects={'policy_class': MAPPOPolicy})
+            warm_start = True
             models = [model] * config.num_satellites
         else:
-            print("  Creating new shared MAPPO model...")
-            # ── Async Rollout Architecture ──────────────────────────────────
-            # SubprocVecEnv runs env.step() in N parallel subprocesses.  The
-            # main process handles GPU policy forward passes (predict), then
-            # sends actions back to subprocesses for the next step.  This
-            # pipelining keeps both CPU (physics) and GPU (inference/training)
-            # busy simultaneously.  n_steps × n_envs = total rollout buffer
-            # size per gradient update; we auto-scale n_steps to keep the
-            # total ~4096 regardless of how many envs are active.
-            _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
+            print("  No existing model found — creating new shared MAPPO model...")
+            print(f"  (Searched for: {MODEL_PATH})")
             _n_steps = _enforce_rollout_length(env_wrapper.n_envs, env_max_steps=_env_max_steps)
             model = PPO(
                 MAPPOPolicy, env_wrapper.vec_env,
@@ -394,20 +422,21 @@ def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteCon
                     use_mappo=USE_MAPPO,
                 )
             )
-            # Transfer Phase B knowledge
             transfer_phase_a_to_phase_b(PHASE_B_ZIP, model)
             models = [model] * config.num_satellites
     else:
         # Independent model per agent
         for agent_idx in range(config.num_satellites):
-            model_path = f"ppo_swarm_brain_sat{agent_idx}.bin"
-            if os.path.exists(model_path):
-                print(f"  ✓ Loading agent {agent_idx} model from {model_path}")
+            base_path = f"ppo_swarm_brain_sat{agent_idx}.zip"
+            found_path = _find_model(base_path)
+            if found_path:
+                print(f"  ✓ Loading agent {agent_idx} model from {found_path}")
                 from rl_training.ctde_policy import CTDEPolicy
-                model = PPO.load(model_path, env=env_wrapper.vec_env, custom_objects={'policy_class': MAPPOPolicy})
+                model = PPO.load(found_path, env=env_wrapper.vec_env,
+                                 custom_objects={'policy_class': MAPPOPolicy})
+                warm_start = True
             else:
                 print(f"  Creating new model for agent {agent_idx}...")
-                _env_max_steps = getattr(env_wrapper, 'max_steps', 360)
                 _n_steps = _enforce_rollout_length(env_wrapper.n_envs, env_max_steps=_env_max_steps)
                 model = PPO(
                     MAPPOPolicy, env_wrapper.vec_env,
@@ -430,8 +459,13 @@ def build_or_load_models(env_wrapper: MultiAgentEnvWrapper, config: SatelliteCon
                 )
                 transfer_phase_a_to_phase_b(PHASE_B_ZIP, model)
             models.append(model)
-    
-    return models
+
+    if warm_start:
+        print(f"  WARM START: curriculum will begin at Phase {WARM_START_PHASE} (skipping easy phases 1-3)")
+    else:
+        print("  COLD START: curriculum will begin at Phase 1")
+
+    return models, warm_start
 
 
 def run_evaluation(models: List[PPO], config: SatelliteConfig, memory: EpisodicMemory, 
@@ -553,7 +587,7 @@ def main():
     env_wrapper = MultiAgentEnvWrapper(config=config, max_steps=360, n_envs=N_ENVS, memory=memory)
     
     # Models
-    models = build_or_load_models(env_wrapper, config)
+    models, warm_start = build_or_load_models(env_wrapper, config)
     
     # EWC
     ewc = EWC(ewc_lambda=EWC_LAMBDA, filepath=EWC_PATH)
@@ -585,7 +619,7 @@ def main():
     print(f"  {'─'*68}")
     
     for cycle in range(1, CYCLES + 1):
-        phase = curriculum_phase(cycle)
+        phase = curriculum_phase(cycle, warm_start=warm_start)
         env_wrapper.set_curriculum_phase(phase)
         
         # Train shared model (or each model if no parameter sharing)

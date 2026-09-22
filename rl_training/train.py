@@ -261,16 +261,28 @@ def run_evaluation(
             collisions_ep[i].append(env.collisions[i])
             fuel_outs_ep[i].append(env.fuel_outs[i])
             rewards_ep[i].append(float(np.sum(env.reward_history[i])))
-        if ep == 0:
-            memory.record(
-                total_reward=float(np.mean([np.sum(env.reward_history[i]) for i in range(n)])),
-                collisions=int(np.sum([env.collisions[i] for i in range(n)])),
-                fuel_outs=int(np.sum([env.fuel_outs[i] for i in range(n)])),
-                steps=env.current_step,
-                was_eclipse=bool(np.any(env.eclipse_mode)),
-                was_weather=env.space_weather_active,
-                was_fault=bool(np.any(env.faults_logged > 0)),
-            )
+        # Record every episode (not just ep==0) with full orbital_state so
+        # Orbital Salience Gating (OSG) can retrieve meaningfully later.
+        _ep_reward = float(np.mean([np.sum(env.reward_history[i]) for i in range(n)]))
+        _rec = memory.record(
+            total_reward=_ep_reward,
+            collisions=int(np.sum([env.collisions[i] for i in range(n)])),
+            fuel_outs=int(np.sum([env.fuel_outs[i] for i in range(n)])),
+            steps=env.current_step,
+            was_eclipse=bool(np.any(env.eclipse_mode)),
+            was_weather=env.space_weather_active,
+            was_fault=bool(np.any(env.faults_logged > 0)),
+        )
+        # Patch orbital_state + timestamp onto the just-appended EpisodeRecord
+        # so OSG has a real vector to compare against at retrieval time.
+        if memory.episodes:
+            _last = memory.episodes[-1]
+            _last.orbital_state = {
+                "altitude_km":       config.orbit.altitude_km,
+                "true_anomaly":      float(env.agent_pos[0]),
+                "eclipse_fraction":  float(env.eclipse_fraction[0]),
+            }
+            _last.timestamp_step = int(ep * ep_steps + env.current_step)
 
     return collisions_ep, fuel_outs_ep, rewards_ep
 

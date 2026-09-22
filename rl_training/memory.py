@@ -264,6 +264,202 @@ class EpisodicMemory:
                 
         return best_ep
 
+    # ── Orbital Salience Gating (OSG) ─────────────────────────────────────────
+
+    @staticmethod
+    def _orbital_state_to_vec(orbital_state: dict) -> np.ndarray:
+        """
+        Convert an orbital_state dict to a 1-D numpy float64 array.
+
+        Keys are sorted alphabetically so the same set of keys always
+        produces the same ordering.  Only numeric (int / float) values
+        are included; non-numeric values are silently skipped.
+        """
+        if not orbital_state:
+            return np.array([], dtype=np.float64)
+        vec = []
+        for k in sorted(orbital_state.keys()):
+            v = orbital_state[k]
+            if isinstance(v, (int, float)):
+                vec.append(float(v))
+        return np.array(vec, dtype=np.float64)
+
+    def osg_score(self,
+                  current_orbital_state: dict,
+                  episode: "EpisodeRecord",
+                  current_timestep: int,
+                  beta: float = 0.001) -> float:
+        """
+        Compute the three-factor Orbital Salience Gating score.
+
+        score = cosine_sim
+                × sigmoid(R_j - R_mean)
+                × exp(-beta × age)
+
+        Where:
+          cosine_sim  — cosine similarity between current and stored
+                        orbital state vectors.
+          R_j         — episode.total_reward
+          R_mean      — mean total_reward across ALL stored episodes
+                        (computed fresh from self.episodes each call).
+          sigmoid(x)  — 1 / (1 + exp(-x))
+          age         — current_timestep - episode.timestamp_step
+                        (clamped to 0 if timestamp_step is missing / 0).
+
+        Edge cases:
+          • current_orbital_state is None or {}  → return 0.0
+          • episode.orbital_state is None or {}  → return 0.0
+          • Either vector norm is 0              → cosine_sim = 0.0
+          • No stored episodes for R_mean        → R_mean = 0.0
+
+        Args:
+            current_orbital_state: The query orbital state dict.
+            episode:               The candidate EpisodeRecord.
+            current_timestep:      Global step counter at query time.
+            beta:                  Temporal decay rate (per step).
+                                   Use compute_beta() for a physics
+                                   grounded value.
+
+        Returns:
+            float score in roughly [0, 1].
+        """
+        # ── guard: orbital states ────────────────────────────────────────────
+        if not current_orbital_state:
+            return 0.0
+        ep_orbital = getattr(episode, "orbital_state", None)
+        if not ep_orbital:
+            return 0.0
+
+        # ── cosine similarity ────────────────────────────────────────────────
+        cur_vec = self._orbital_state_to_vec(current_orbital_state)
+        ep_vec  = self._orbital_state_to_vec(ep_orbital)
+
+        # Vectors must share the same dimensionality; fall back to 0 if not
+        if cur_vec.size == 0 or ep_vec.size == 0 or cur_vec.shape != ep_vec.shape:
+            cosine_sim = 0.0
+        else:
+            cur_norm = np.linalg.norm(cur_vec)
+            ep_norm  = np.linalg.norm(ep_vec)
+            if cur_norm < 1e-12 or ep_norm < 1e-12:
+                cosine_sim = 0.0
+            else:
+                cosine_sim = float(np.dot(cur_vec, ep_vec) / (cur_norm * ep_norm))
+
+        # ── reward salience: sigmoid(R_j - R_mean) ──────────────────────────
+        R_j = float(episode.total_reward)
+        if self.episodes:
+            R_mean = float(np.mean([e.total_reward for e in self.episodes]))
+        else:
+            R_mean = 0.0
+        reward_factor = 1.0 / (1.0 + np.exp(-(R_j - R_mean)))
+
+        # ── temporal decay: exp(-beta × age) ────────────────────────────────
+        ts = getattr(episode, "timestamp_step", 0) or 0
+        age = max(0, current_timestep - ts)
+        temporal_factor = float(np.exp(-beta * age))
+
+        return cosine_sim * reward_factor * temporal_factor
+
+    def osg_retrieve(self,
+                     current_orbital_state: dict,
+                     current_timestep: int,
+                     top_k: int = 5,
+                     beta: float = 0.001):
+        """
+        Retrieve the top-k most relevant past episodes using OSG scoring,
+        alongside a cosine-only baseline for comparison.
+
+        Steps:
+          1. Loop through all stored episodes.
+          2. Compute osg_score() for each.
+          3. Compute a cosine-only baseline score for each (same cosine
+             similarity, but reward and temporal factors are omitted).
+          4. Sort both lists by their respective scores descending.
+          5. Return the top_k from each.
+
+        Args:
+            current_orbital_state: The query orbital state dict.
+            current_timestep:      Global step counter at query time.
+            top_k:                 Number of top episodes to return.
+            beta:                  Temporal decay rate (per step).
+
+        Returns:
+            Tuple (osg_results, baseline_results) where each element is
+            a list of (score, EpisodeRecord) tuples of length ≤ top_k.
+        """
+        if not self.episodes:
+            return [], []
+
+        osg_scores      = []
+        baseline_scores = []
+
+        cur_vec  = self._orbital_state_to_vec(current_orbital_state) \
+                   if current_orbital_state else np.array([])
+        cur_norm = float(np.linalg.norm(cur_vec)) if cur_vec.size > 0 else 0.0
+
+        for ep in self.episodes:
+            # ── OSG score ───────────────────────────────────────────────────
+            osg_s = self.osg_score(current_orbital_state, ep,
+                                   current_timestep, beta=beta)
+            osg_scores.append((osg_s, ep))
+
+            # ── Baseline: cosine only ────────────────────────────────────────
+            ep_orbital = getattr(ep, "orbital_state", None)
+            if not ep_orbital or cur_vec.size == 0 or cur_norm < 1e-12:
+                cos_s = 0.0
+            else:
+                ep_vec  = self._orbital_state_to_vec(ep_orbital)
+                if ep_vec.shape != cur_vec.shape or ep_vec.size == 0:
+                    cos_s = 0.0
+                else:
+                    ep_norm = float(np.linalg.norm(ep_vec))
+                    if ep_norm < 1e-12:
+                        cos_s = 0.0
+                    else:
+                        cos_s = float(np.dot(cur_vec, ep_vec) /
+                                      (cur_norm * ep_norm))
+            baseline_scores.append((cos_s, ep))
+
+        osg_scores.sort(key=lambda x: x[0], reverse=True)
+        baseline_scores.sort(key=lambda x: x[0], reverse=True)
+
+        return osg_scores[:top_k], baseline_scores[:top_k]
+
+    def print_osg_comparison(self,
+                              osg_results: list,
+                              baseline_results: list,
+                              current_timestep: int = 0) -> None:
+        """
+        Print a side-by-side comparison table of OSG vs baseline retrieval.
+
+        This is for debugging / proof-of-concept only — it shows which
+        episodes each method selects so you can inspect whether OSG picks
+        higher-reward, contextually richer episodes over stale low-reward
+        ones favoured by cosine-only retrieval.
+
+        Args:
+            osg_results:       List of (score, EpisodeRecord) from osg_retrieve.
+            baseline_results:  List of (score, EpisodeRecord) from osg_retrieve.
+            current_timestep:  Used to compute age of each episode.
+        """
+        print("\n=== OSG vs Baseline Retrieval Comparison ===")
+        print(f"{'Rank':<5} {'Method':<10} {'Score':<8} "
+              f"{'Ep_ID':<7} {'Reward':<8} {'Age':<6}")
+        print(f"{'-'*5} {'-'*10} {'-'*8} {'-'*7} {'-'*8} {'-'*6}")
+
+        max_rank = max(len(osg_results), len(baseline_results))
+        for rank in range(max_rank):
+            for label, results in [("OSG", osg_results),
+                                   ("Baseline", baseline_results)]:
+                if rank < len(results):
+                    score, ep = results[rank]
+                    ts  = getattr(ep, "timestamp_step", 0) or 0
+                    age = max(0, current_timestep - ts)
+                    print(f"{rank + 1:<5} {label:<10} {score:<8.3f} "
+                          f"{ep.episode_id:<7} {ep.total_reward:<+8.1f} {age:<6}")
+
+        print()
+
     # ── summary ────────────────────────────────────────────────────────────────
     def _recompute_stats(self) -> None:
         """Recompute best/worst/total_seen from current episodes."""

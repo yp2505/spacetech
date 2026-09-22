@@ -1,0 +1,6 @@
+metric,baseline,osg,percent_change
+avg_total_reward,-94.345128,-94.345128,0.0000
+avg_targets_hit,1.300000,1.300000,0.0000
+avg_wasted_actions,9.800000,9.800000,0.0000
+avg_fuel_remaining,97.949279,97.949279,0.0000
+memory_helped_rate,0.000000,0.000000,nan
