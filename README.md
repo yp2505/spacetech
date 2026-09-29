@@ -4,7 +4,7 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![Gymnasium](https://img.shields.io/badge/gymnasium-0.29+-green.svg)](https://gymnasium.farama.org/)
 [![Stable-Baselines3](https://img.shields.io/badge/stable--baselines3-2.3+-orange.svg)](https://stable-baselines3.readthedocs.io/)
-[![Tests Passing](https://img.shields.io/badge/tests-19%2F19%20passed-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-21%2F21%20passed-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An end-to-end, high-fidelity autonomous satellite swarm management platform and real-time flight software (FSW) architecture. **SpaceTech** combines advanced orbital mechanics, multi-agent reinforcement learning (MAPPO/PPO), continual learning via Elastic Weight Consolidation (EWC), distributed peer-to-peer memory gossip, and a deterministic safety-critical flight executive—**ARTEMIS** (*Autonomous Real-Time Embedded Mission Intelligence System*).
@@ -20,13 +20,14 @@ An end-to-end, high-fidelity autonomous satellite swarm management platform and 
     - [Layer-by-Layer Architectural Breakdown](#3-layer-by-layer-architectural-breakdown)
 4. [Flight Software (FSW) — ARTEMIS Executive](#flight-software-fsw--artemis-executive)
 5. [Reinforcement Learning & Universal Swarm Brain](#reinforcement-learning--universal-swarm-brain)
-6. [Orbital Physics & Dynamics Engine](#orbital-physics--dynamics-engine)
-7. [Constellation Presets & Orbital Regimes](#constellation-presets--orbital-regimes)
-8. [Ground Stations & Line-of-Sight Network](#ground-stations--line-of-sight-network)
-9. [Visualization & Telemetry Suite](#visualization--telemetry-suite)
-10. [Repository Structure](#repository-structure)
-11. [Installation & Setup](#installation--setup)
-12. [Usage Guide & CLI Commands](#usage-guide--cli-commands)
+6. [Orbital Salience Gating (OSG)](#orbital-salience-gating-osg)
+7. [Orbital Physics & Dynamics Engine](#orbital-physics--dynamics-engine)
+8. [Constellation Presets & Orbital Regimes](#constellation-presets--orbital-regimes)
+9. [Ground Stations & Line-of-Sight Network](#ground-stations--line-of-sight-network)
+10. [Visualization & Telemetry Suite](#visualization--telemetry-suite)
+11. [Repository Structure](#repository-structure)
+12. [Installation & Setup](#installation--setup)
+13. [Usage Guide & CLI Commands](#usage-guide--cli-commands)
     - [Running Automated Unit & SIL Tests](#1-running-automated-unit--sil-tests)
     - [Evaluating Pre-trained Universal Swarm Brain](#2-evaluating-pre-trained-universal-swarm-brain)
     - [Training Single Orbits (LEO, MEO, GEO)](#3-training-single-orbits-leo-meo-geo)
@@ -50,6 +51,7 @@ An end-to-end, high-fidelity autonomous satellite swarm management platform and 
   - Fault Detection, Isolation, and Recovery (FDIR) state machine (`BOOT` $\to$ `NOMINAL` $\to$ `DEGRADED` $\to$ `RECOVERY` $\to$ `SAFE_MODE`).
   - Deterministic Safety Supervisor & Command Arbiter enforcing strict operational hierarchies: **Safety > Health > Mission > Constellation > Longevity**.
 - **Distributed Episodic Memory Gossip**: Decentralized peer-to-peer experience sharing across an Inter-Satellite Link (ISL) mesh network. Salience-weighted priority replay buffers gossip high-impact events (near-misses, subsystem anomalies, recovery maneuvers) across the fleet.
+- **Orbital Salience Gating (OSG)**: A physics-informed episodic-memory retrieval heuristic that combines orbital-state similarity, episode reward, and recency. Its decay rate is calibrated so that a memory's half-life is one orbital period.
 - **Cryptographic ISL Communication**: Rolling-XOR and SHA-256 key derivation for secure, authenticated inter-satellite telemetry and data routing.
 - **Full-Spectrum Sensor & Actuator Dynamics**: 3D attitude determination (quaternions, Euler rates), reaction wheel saturation/desaturation, thruster thermal limits, cold gas/chemical/ion/Hall-effect propulsion models, and solar radiation pressure.
 - **Comprehensive Visualization Tools**:
@@ -289,6 +291,61 @@ $$\mathcal{L}(\theta) = \mathcal{L}_{\text{PPO}}(\theta) + \sum_{i} \frac{\lambd
 
 - $\lambda = 5000.0$: Regularization parameter protecting previously learned orbital mechanics.
 - **Fisher Computation**: Evaluated over 400 policy rollouts across all orbital configurations, protecting 565,329 neural network parameters.
+
+---
+
+## Orbital Salience Gating (OSG)
+
+OSG is a proposed episodic-memory retrieval heuristic for the satellite-swarm reinforcement-learning workflow. Its objective is to retrieve past episodes that are not only orbitally similar to the satellite's current situation, but also higher quality and recent enough to remain operationally useful.
+
+For a current orbital state and a stored episode $j$, the memory score is:
+
+$$
+\operatorname{OSGScore}_j =
+\operatorname{cosine\_similarity}(\mathbf{x}_{\mathrm{current}}, \mathbf{x}_j)
+\times
+\sigma(R_j - \overline{R})
+\times
+\exp(-\beta\,\operatorname{age}_j)
+$$
+
+where:
+
+- $\mathbf{x}$ is the orbital-state vector: altitude, eclipse fraction, and true anomaly.
+- $\operatorname{cosine\_similarity}$ selects episodes occurring in similar orbital conditions.
+- $R_j$ is the candidate episode's total reward and $\overline{R}$ is the mean reward across stored episodes. The sigmoid $\sigma$ increases the weight of above-average episodes.
+- $\operatorname{age}_j$ is the number of simulation steps since the episode was recorded.
+- $\beta$ is the temporal decay rate per simulation step.
+
+### Physics-grounded temporal decay
+
+Rather than choosing $\beta$ as an arbitrary hyperparameter, OSG derives it from the circular-orbit period using Kepler's third law:
+
+$$
+T = 2\pi\sqrt{\frac{(R_{\mathrm{Earth}} + h)^3}{\mu}}
+$$
+
+The design sets one orbital period to be the memory half-life:
+
+$$
+\exp(-\beta T_{\mathrm{steps}})=0.5
+\qquad\Rightarrow\qquad
+\beta=\frac{\ln(2)}{T_{\mathrm{steps}}}
+$$
+
+For the default 550 km LEO configuration, with 15.9 simulated seconds per step, this gives an orbital period of approximately 5,730.13 seconds (95.50 minutes), 360.39 simulation steps, and $\beta \approx 0.001923349$ per step. Therefore, an episode retains 50% of its temporal weight after one orbit and 25% after two orbits.
+
+### Implementation and evaluation
+
+- `utils/orbital_decay.py` implements the Kepler-based `compute_beta()` calculation.
+- `rl_training/memory.py` implements `osg_score()` and `osg_retrieve()`.
+- During evaluation, each stored episode records `altitude_km`, `true_anomaly`, `eclipse_fraction`, total reward, and timestamp.
+- `experiments/osg_comparison.py` compares OSG retrieval with a cosine-similarity-only baseline using fixed random seeds and saves results to `matlab_export/osg_comparison_results.csv`.
+- `SingleAgentWrapper` and `fsw/ai_brain/agent.py` compress the top retrieved OSG episodes into the four-value memory context appended to the PPO input before action inference.
+
+The previous experiment output reports no difference between OSG and the cosine-only baseline because retrieval had not been connected to the PPO input at the time it was generated. OSG is now part of the live PPO observation path, so the experiment must be re-run and the resulting CSV must replace the previous result before making any performance claim. OSG should therefore remain described as a **physics-informed retrieval proposal** until repeated closed-loop evaluations show a statistically reliable improvement.
+
+Planned validation work includes passing retrieved memories into the policy context, normalizing orbital-state features, evaluating LEO/MEO/GEO configurations, and comparing OSG against fixed-decay, learned-decay, reward-only, and cosine-only baselines across repeated seeds.
 
 ---
 
@@ -615,8 +672,12 @@ test_phase_features:
   test_blackout_windows_are_station_scoped ................................... OK
   test_config_rejects_ambiguous_plane_layout ................................. OK
 
+test_osg_policy_integration:
+  test_osg_context_is_bounded_and_retrieval_derived .......................... OK
+  test_wrapper_appends_live_osg_context_and_records_episode .................. OK
+
 ----------------------------------------------------------------------
-Ran 19 tests in 6.749s -- ALL OK (19 passed, 0 failed, 0 errors)
+Ran 21 tests -- ALL OK (21 passed, 0 failed, 0 errors)
 ```
 
 ---

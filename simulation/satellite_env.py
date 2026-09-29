@@ -49,6 +49,7 @@ except ImportError:
     EARTH_RADIUS_KM = 6378.1
 
 from simulation.sat_config import SatelliteConfig, PRESETS, MissionType
+from utils.orbital_decay import compute_beta
 from simulation.orbital_physics import (
     get_walker_delta_params, anomaly_to_ecef, check_ground_station_los,
     GROUND_STATIONS, latlon_to_ecef,
@@ -121,6 +122,12 @@ class SingleAgentWrapper(gym.Env):
         self.agent_idx = agent_idx
         self.memory    = memory
         self.env       = MultiSatelliteEnv(config=self.config, max_steps=max_steps)
+        self._osg_timestep = 0
+        self._episode_reward = 0.0
+        self._osg_beta, _, _ = compute_beta(
+            self.config.orbit.altitude_km,
+            steps_per_second=1.0 / self.config.orbit.step_seconds,
+        )
 
         # Continuous 4D action: [thrust, roll_torque, pitch_torque, yaw_torque]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
@@ -135,7 +142,8 @@ class SingleAgentWrapper(gym.Env):
     def reset(self, seed=None, options=None):
         self.env.curriculum_phase = self.curriculum_phase
         obs_raw, info = self.env.reset(seed=seed)
-        return self._augment(obs_raw[self.agent_idx]), info
+        self._episode_reward = 0.0
+        return self._augment(obs_raw[self.agent_idx], self.agent_idx), info
 
     def step(self, action):
         n = self.config.num_satellites
@@ -146,17 +154,52 @@ class SingleAgentWrapper(gym.Env):
             obs_raw_all = self.env._get_obs_list()
             for i in range(n):
                 if i != self.agent_idx:
-                    o = self._augment(obs_raw_all[i])
+                    o = self._augment(obs_raw_all[i], i)
                     a, _ = self.other_model.predict(o, deterministic=True)
                     actions[i] = a
 
         obs_raw, rewards, term, trunc, info = self.env.step(actions)
-        return self._augment(obs_raw[self.agent_idx]), rewards[self.agent_idx], term, trunc, info
+        self._osg_timestep += 1
+        self._episode_reward += float(rewards[self.agent_idx])
+        if (term or trunc) and self.memory is not None:
+            self._record_osg_episode()
+        return (self._augment(obs_raw[self.agent_idx], self.agent_idx),
+                rewards[self.agent_idx], term, trunc, info)
 
-    def _augment(self, base_obs: dict) -> dict:
-        """Append 4-dim episodic memory context to local observation."""
-        ctx = (self.memory.get_context() if self.memory is not None
-               else np.zeros(MEMORY_CTX_DIM, dtype=np.float32))
+    def _orbital_state(self, agent_idx: int) -> dict:
+        """Return the live orbital features used by the OSG memory query."""
+        return {
+            "altitude_km": float(self.config.orbit.altitude_km),
+            "true_anomaly": float(self.env.agent_pos[agent_idx]),
+            "eclipse_fraction": float(self.env.eclipse_fraction[agent_idx]),
+        }
+
+    def _record_osg_episode(self) -> None:
+        """Store the completed episode with the state and time needed by OSG."""
+        self.memory.record(
+            total_reward=self._episode_reward,
+            collisions=int(self.env.collisions[self.agent_idx]),
+            fuel_outs=int(self.env.fuel_outs[self.agent_idx]),
+            steps=self.env.current_step,
+            was_eclipse=bool(self.env.eclipse_mode[self.agent_idx]),
+            was_weather=bool(self.env.space_weather_active),
+            was_fault=bool(self.env.faults_logged[self.agent_idx] > 0),
+        )
+        record = self.memory.episodes[-1]
+        record.orbital_state = self._orbital_state(self.agent_idx)
+        record.timestamp_step = self._osg_timestep
+
+    def _augment(self, base_obs: dict, agent_idx: int = None) -> dict:
+        """Append a live OSG-derived four-value context to the PPO input."""
+        if self.memory is None:
+            ctx = np.zeros(MEMORY_CTX_DIM, dtype=np.float32)
+        else:
+            idx = self.agent_idx if agent_idx is None else agent_idx
+            ctx = self.memory.osg_context(
+                current_orbital_state=self._orbital_state(idx),
+                current_timestep=self._osg_timestep,
+                beta=self._osg_beta,
+            )
         local = np.concatenate([base_obs["local"], ctx]).astype(np.float32)
         return {"local": local, "global": base_obs["global"]}
 

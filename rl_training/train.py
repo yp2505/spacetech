@@ -54,6 +54,7 @@ from rl_training.ewc import EWC
 from rl_training.network_surgery import transfer_phase_a_to_phase_b
 from rl_training.distributed_memory import DistributedEpisodicMemory, GossipConfig, ConstellationMemoryGossip
 from fsw.hal.isl_mesh import ISLMeshNetwork
+from utils.orbital_decay import compute_beta
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Hyper-parameters (can be overridden by CLI args)
@@ -244,11 +245,25 @@ def run_evaluation(
         env.curriculum_phase = 6   # Always evaluate on full Phase 6 (faults + thermal)
         obs_raw, _ = env.reset()
 
-        ctx = memory.get_context() if memory else np.zeros(4, dtype=np.float32)
+        beta = None
+        if memory:
+            beta, _, _ = compute_beta(
+                config.orbit.altitude_km,
+                steps_per_second=1.0 / config.orbit.step_seconds,
+            )
 
         for _ in range(ep_steps):
             actions = []
             for i in range(n):
+                ctx = (memory.osg_context(
+                    current_orbital_state={
+                        "altitude_km": config.orbit.altitude_km,
+                        "true_anomaly": float(env.agent_pos[i]),
+                        "eclipse_fraction": float(env.eclipse_fraction[i]),
+                    },
+                    current_timestep=ep * ep_steps + env.current_step,
+                    beta=beta,
+                ) if memory else np.zeros(4, dtype=np.float32))
                 local = np.concatenate([obs_raw[i]["local"], ctx]).astype(np.float32)
                 obs_d = {"local": local, "global": obs_raw[i]["global"]}
                 a, _  = model.predict(obs_d, deterministic=True)

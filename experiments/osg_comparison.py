@@ -201,8 +201,6 @@ def run_session(
         env.curriculum_phase = CURRICULUM_PHASE
         obs_raw, _ = env.reset(seed=seed)
 
-        ctx = mem.get_context()
-
         # Track whether memory was helpful at the start of the episode
         ep_memory_helped_flags = []
 
@@ -224,6 +222,11 @@ def run_session(
                     current_state, current_t, top_k=TOP_K, beta=beta
                 )
                 retrieved = base_res
+
+            # The selected memories now enter the PPO actor through the
+            # existing four-value memory context. This makes the comparison
+            # closed-loop: retrieval can change the actions and mission result.
+            ctx = mem.context_from_retrieval(retrieved)
 
             # memory_helped: top retrieved episode has reward > R_mean_pool
             if retrieved:

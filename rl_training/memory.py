@@ -180,6 +180,73 @@ class EpisodicMemory:
         return np.array([mean_rew_01, mean_col, mean_fuel, best_qual],
                         dtype=np.float32)
 
+    def context_from_retrieval(self, retrieved: list) -> np.ndarray:
+        """Build the four PPO memory features from ranked retrieved episodes.
+
+        The feature order deliberately preserves the existing actor contract:
+        reward quality, collision rate, fuel-out rate, and retrieval confidence.
+        This lets OSG affect the PPO action through its observation without
+        changing the 48-dimensional observation schema.
+
+        Args:
+            retrieved: Sequence of ``(score, EpisodeRecord)`` pairs, normally
+                returned by :meth:`osg_retrieve`.
+
+        Returns:
+            Four float32 values in ``[0, 1]``. Falls back to the legacy global
+            memory summary when no positively scored episode is available.
+        """
+        usable = [(max(0.0, float(score)), ep) for score, ep in retrieved
+                  if np.isfinite(score) and float(score) > 0.0]
+        if not usable:
+            return self.get_context()
+
+        scores = np.array([score for score, _ in usable], dtype=np.float64)
+        weights = scores / scores.sum()
+        episodes = [ep for _, ep in usable]
+        rewards = np.array([float(ep.total_reward) for ep in episodes], dtype=np.float64)
+        all_rewards = (np.array([float(ep.total_reward) for ep in self.episodes], dtype=np.float64)
+                       if self.episodes else np.array([0.0], dtype=np.float64))
+        reward_mean = float(np.mean(all_rewards))
+
+        # Match OSG's reward-salience term, averaged across the retrieved set.
+        reward_quality = float(np.sum(
+            weights * (1.0 / (1.0 + np.exp(-(rewards - reward_mean))))
+        ))
+        collision_rate = float(np.sum(weights * np.array([
+            np.clip(ep.collisions / max(ep.steps, 1), 0.0, 1.0)
+            for ep in episodes
+        ], dtype=np.float64)))
+        fuel_out_rate = float(np.sum(weights * np.array([
+            np.clip(ep.fuel_outs / max(ep.steps, 1), 0.0, 1.0)
+            for ep in episodes
+        ], dtype=np.float64)))
+        confidence = float(np.clip(np.sum(weights * scores), 0.0, 1.0))
+
+        return np.array(
+            [reward_quality, collision_rate, fuel_out_rate, confidence],
+            dtype=np.float32,
+        )
+
+    def osg_context(self,
+                    current_orbital_state: dict,
+                    current_timestep: int,
+                    beta: float,
+                    top_k: int = 5) -> np.ndarray:
+        """Return a PPO-ready context built from the current OSG retrieval.
+
+        This is the policy integration point for Orbital Salience Gating:
+        the ranked OSG memories are compressed into four bounded features and
+        appended to the actor's local observation before action inference.
+        """
+        osg_results, _ = self.osg_retrieve(
+            current_orbital_state=current_orbital_state,
+            current_timestep=current_timestep,
+            top_k=top_k,
+            beta=beta,
+        )
+        return self.context_from_retrieval(osg_results)
+
     # ── persistence ────────────────────────────────────────────────────────────
     def save(self) -> None:
         """Persist memory to disk."""
